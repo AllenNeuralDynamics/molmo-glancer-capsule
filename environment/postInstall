@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -e
+
+cd /code/lib/neuroglancer-chat/
+pip install -e .
+
+cd /code/lib/molmo-glancer/
+pip install -e .
+
+
+playwright install --with-deps chromium
