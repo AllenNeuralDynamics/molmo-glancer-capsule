@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -e
 
-cd /root/capsule/code/lib/neuroglancer-chat/
+cd lib/neuroglancer-chat/
 pip install -e .
 cd -
 
-cd /root/capsule/code/lib/molmo-glancer/
+cd lib/molmo-glancer/
 pip install -e .
 cd -
 
