@@ -11,13 +11,16 @@
 		"apt": {
 			"packages": [
 				{
-					"name": "gcc"
+					"name": "gcc",
+					"version": "4:11.2.0-1ubuntu1"
 				},
 				{
-					"name": "libgl1-mesa-glx"
+					"name": "libgl1-mesa-glx",
+					"version": "23.0.4-0ubuntu1~22.04.1"
 				},
 				{
-					"name": "libglib2.0-0"
+					"name": "libglib2.0-0",
+					"version": "2.72.4-0ubuntu2.9"
 				}
 			],
 			"install_software_properties_common": true
@@ -25,7 +28,8 @@
 		"pip3": {
 			"packages": [
 				{
-					"name": "ai2-olmo-core"
+					"name": "ai2-olmo-core",
+					"version": "2.4.0"
 				}
 			],
 			"options": {},

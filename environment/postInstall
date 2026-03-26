@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -e
 
-cd lib/neuroglancer-chat/
-pip install -e .
-cd -
+# ERROS move these to dev startup
+# cd lib/neuroglancer-chat/
+# pip install -e .
+# cd -
 
-cd lib/molmo-glancer/
-pip install -e .
-cd -
+# cd lib/molmo-glancer/
+# pip install -e .
+# cd -
 
-
-playwright install --with-deps chromium
+# command not found
+# playwright install --with-deps chromium
