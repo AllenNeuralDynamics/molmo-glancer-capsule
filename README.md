@@ -1,3 +1,3 @@
-# aind-capsule-template
+# molmo-glancer-capsule
 
-Basic structure of a capsule to be customized as needed.
+TODO README

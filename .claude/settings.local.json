@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//code/olmo-core/**)",
+      "Read(//code/molmo-glancer/**)",
+      "Bash(chmod +x /code/_dev_startup.sh)",
+      "Bash(grep -A 20 ^[project.optional-dependencies] /code/lib/molmo-glancer/pyproject.toml)",
+      "Bash(grep -A 5 ^[project] /code/lib/molmo-glancer/pyproject.toml)",
+      "Bash(grep -A 20 ^[project.optional-dependencies] /code/lib/OLMo-core/pyproject.toml)"
+    ]
+  }
+}
