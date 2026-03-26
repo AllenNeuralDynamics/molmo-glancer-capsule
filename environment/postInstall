@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -e
 
-cd /code/lib/neuroglancer-chat/
+cd /root/capsule/code/lib/neuroglancer-chat/
 pip install -e .
+cd -
 
-cd /code/lib/molmo-glancer/
+cd /root/capsule/code/lib/molmo-glancer/
 pip install -e .
+cd -
 
 
 playwright install --with-deps chromium
