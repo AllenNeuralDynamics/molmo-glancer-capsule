@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# cleanup — remove all artifacts from a previous run
+set -e
+
+rm -rf /results/grid_search
+rm -f /results/run_capsule.log
+
+# Kill any stale model servers left from prior runs
+for PORT in 8001 8002; do
+    HEX=$(printf "%04X" $PORT)
+    for INODE in $(awk "NR>1 && \$2 ~ /:${HEX}\$/ && \$4==\"0A\" {print \$10}" /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u); do
+        PID=$(grep -rl "socket:\[${INODE}\]" /proc/*/fd 2>/dev/null | grep -oP '(?<=/proc/)\d+' | head -1)
+        if [ -n "$PID" ]; then
+            echo "Killing stale process on port $PORT (PID $PID)"
+            kill -9 $PID 2>/dev/null || true
+        fi
+    done
+done
+
+echo "Cleaned."
