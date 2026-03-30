@@ -69,7 +69,11 @@ Or: add `[tool.setuptools.packages.find]` to molmoweb's `pyproject.toml` (prefer
 
 **Root cause:** `NativeActionPredictor.__init__` calls `model_cfg.build_model()` with PyTorch's default dtype (float32). The 4.46B-parameter model = **17.8 GB in float32**, exceeding the T4's 14.56 GB.
 
-**Fix applied** in `code/lib/molmoweb/agent/model_backends.py`: set `torch.set_default_dtype(torch.bfloat16)` around the `build_model()` call. In bfloat16, the model is **8.9 GB** — fits with headroom.
+**Fix applied** in `code/lib/molmoweb/agent/model_backends.py`: model is built and loaded as `torch.float16` (~8.9 GB, fits on T4). `torch.autocast(device_type="cuda", dtype=torch.float16)` wraps the `generate()` call to handle any float32 intermediates produced inside the model's forward pass.
+
+**Do NOT use bfloat16** for the model weights — T4 (CC 7.5) lacks native bfloat16 matmul support; PyTorch silently emulates it via float32, which wastes VRAM headroom.
+
+**Do NOT drop autocast** — without it, internal float32 tensors (position embeddings, attention buffers) hit a `mat1/mat2 dtype mismatch: Float vs Half` error on every call.
 
 **No `_dev_startup2.sh` change needed** — this is a code fix in the molmoweb fork.
 
