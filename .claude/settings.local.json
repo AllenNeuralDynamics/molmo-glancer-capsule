@@ -108,7 +108,9 @@
       "Bash(do echo:*)",
       "Bash(git -C \"$repo\" status --short)",
       "Bash(nvidia-smi --query-gpu=name,memory.total,memory.free,memory.used --format=csv,noheader,nounits)",
-      "WebFetch(domain:allenai.org)"
+      "WebFetch(domain:allenai.org)",
+      "Bash(git -C /root/capsule remote -v)",
+      "Bash(git -C /root/capsule branch -a)"
     ]
   }
 }
