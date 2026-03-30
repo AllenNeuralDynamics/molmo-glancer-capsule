@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-set -ex
-
-# This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
-# python -u run_capsule.py "$@"
-mkdir -p /results
-PLAYWRIGHT_BROWSERS_PATH=/scratch/ms-playwright python3 -u /code/run_capsule.py 2>&1 | tee /results/run_capsule.log
