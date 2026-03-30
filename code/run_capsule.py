@@ -1,9 +1,9 @@
 """
-molmo-glancer v2 — Neuron Counting MVP
-======================================
-Given a Neuroglancer link to a 3D fluorescence microscopy dataset,
-uses Molmo2-O-7B to plan Z-depth views, screenshot each via Playwright,
-visually interpret them, and synthesize a neuron count estimate.
+molmo-glancer v2 — Neuroglancer Visual QA
+==========================================
+Given a Neuroglancer link and an open-ended question about 3D data,
+uses Molmo2-O-7B to plan views, screenshot each via Playwright,
+visually interpret them, and synthesize an answer.
 
 Usage:
     python3 -u /code/run_capsule.py
@@ -11,8 +11,9 @@ Usage:
 
 Outputs (in /results/):
     output.log        — full pipeline log (via run.sh tee)
-    screenshots/      — one PNG per Z-slice
-    findings.json     — per-slice model responses
+    screenshots/      — one PNG per planned view
+    findings.json     — per-view model responses
+    ng_states.json    — NG state used for each screenshot
     answer.txt        — final synthesized answer
 """
 
@@ -29,13 +30,16 @@ from PIL import Image
 # ── Constants ────────────────────────────────────────────────────────────────
 
 CHECKPOINT = "/scratch/checkpoints/Molmo2-O-7B"
-NG_LINK_FILE = "/root/capsule/example_ng_link.txt"
 RESULTS_DIR = Path("/results")
 SCREENSHOT_DIR = RESULTS_DIR / "screenshots"
 VIEWPORT = {"width": 1280, "height": 720}
 DATA_LOAD_WAIT = 12          # seconds to wait for NG async data streaming
-DATA_SHAPE = (495, 495, 215) # hardcoded XYZ shape for this dataset
-FALLBACK_Z_POSITIONS = [20, 60, 100, 140, 180]
+
+# ── Inputs — edit these or override via config ──────────────────────────────
+
+NG_LINK_FILE = "/root/capsule/example_ng_link.txt"
+QUESTION = "How many neurons can you count in this volume?"
+DATA_SHAPE = (495, 495, 215)  # XYZ voxels — TODO: read from zarr metadata
 
 
 # ── Model ────────────────────────────────────────────────────────────────────
@@ -85,7 +89,7 @@ def ask_text(model, processor, prompt: str, max_new_tokens: int = 512) -> str:
 def ask_vision(model, processor, image: Image.Image, prompt: str,
                max_new_tokens: int = 512) -> str:
     """Image+text call to Molmo2. Returns generated text."""
-    # Resize to avoid cuBLAS OOM/dimension errors in 8-bit vision backbone
+    # Resize to limit vision token count for memory stability
     max_side = 512
     if max(image.size) > max_side:
         image = image.copy()
@@ -108,33 +112,43 @@ def ask_vision(model, processor, image: Image.Image, prompt: str,
 
 # ── NeuroglancerState URL generation ─────────────────────────────────────────
 
-def build_view_urls(ng_link: str, z_positions: list[float]):
-    """For each Z position, clone the NG state, set layout='xy' and the Z
-    coordinate, and return a list of (url, metadata_dict)."""
+def build_view_urls(ng_link: str, view_specs: list[dict]):
+    """Given a list of view specs from the model, generate NG URLs.
+
+    Each view_spec is a dict with optional keys: x, y, z, layout.
+    Missing x/y default to center of DATA_SHAPE. Missing layout defaults to 'xy'.
+    Returns list of (url, metadata_dict).
+    """
     from neuroglancer_chat.backend.tools.neuroglancer_state import NeuroglancerState
 
     base_state = NeuroglancerState.from_url(ng_link)
 
-    # Ensure a position exists (the example link has none — default to center)
-    # Position array must match the number of dimensions in the state (x,y,z,t = 4)
-    if "position" not in base_state.data or not base_state.data["position"]:
-        cx, cy = DATA_SHAPE[0] / 2, DATA_SHAPE[1] / 2
-        base_state.data["position"] = [cx, cy, 0, 0]
-    elif len(base_state.data["position"]) == 3:
-        base_state.data["position"].append(0)  # add t=0
+    # Default center position
+    cx, cy = DATA_SHAPE[0] / 2, DATA_SHAPE[1] / 2
+    cz = DATA_SHAPE[2] / 2
 
-    base_state.data["layout"] = "xy"
-    base_pos = base_state.data["position"]
+    # Ensure position array exists with correct length for dimensions
+    num_dims = len(base_state.data.get("dimensions", {}))
+    if "position" not in base_state.data or not base_state.data["position"]:
+        base_state.data["position"] = [cx, cy, cz] + [0] * (num_dims - 3)
+    while len(base_state.data["position"]) < num_dims:
+        base_state.data["position"].append(0)
 
     results = []
     view_states = []
-    for z in z_positions:
+    for i, spec in enumerate(view_specs):
         view = base_state.clone()
-        view.data["position"][2] = z
+        view.data["layout"] = spec.get("layout", "xy")
+        pos = view.data["position"]
+        pos[0] = spec.get("x", cx)
+        pos[1] = spec.get("y", cy)
+        pos[2] = spec.get("z", cz)
+
         url = view.to_url()
-        meta = {"x": base_pos[0], "y": base_pos[1], "z": z}
+        meta = {"view": i, "x": pos[0], "y": pos[1], "z": pos[2],
+                "layout": view.data["layout"]}
         results.append((url, meta))
-        view_states.append({"z": z, "url": url, "state": view.data})
+        view_states.append({"view": i, "url": url, "state": view.data})
 
     # Dump all NG states for debugging
     states_path = RESULTS_DIR / "ng_states.json"
@@ -163,14 +177,15 @@ def take_screenshots(urls_with_meta: list[tuple[str, dict]]) -> list[tuple[Image
         page = context.new_page()
 
         for i, (url, meta) in enumerate(urls_with_meta):
-            print(f"  Screenshotting Z={meta['z']} ({i+1}/{len(urls_with_meta)}) ...")
+            label = f"view {meta['view']}"
+            print(f"  Screenshotting {label} ({i+1}/{len(urls_with_meta)}) ...")
             page.goto(url, wait_until="domcontentloaded")
             time.sleep(DATA_LOAD_WAIT)
 
             png_bytes = page.screenshot()
             img = Image.open(BytesIO(png_bytes)).convert("RGB")
 
-            png_path = SCREENSHOT_DIR / f"z_{meta['z']:.0f}.png"
+            png_path = SCREENSHOT_DIR / f"view_{meta['view']:03d}.png"
             img.save(png_path)
             results.append((img, meta))
 
@@ -182,20 +197,32 @@ def take_screenshots(urls_with_meta: list[tuple[str, dict]]) -> list[tuple[Image
 
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
-def parse_z_positions(response: str) -> list[float]:
-    """Extract a JSON list of Z positions from model response, with fallback."""
-    # Try to find a JSON array anywhere in the response
-    match = re.search(r'\[[\d\s,\.]+\]', response)
+def parse_view_specs(response: str) -> list[dict]:
+    """Extract a JSON list of view specs from model response.
+
+    Expects a JSON array of objects, e.g.:
+        [{"z": 10}, {"z": 50}, {"z": 100}]
+    Falls back to evenly spaced Z slices if parsing fails.
+    """
+    # Find a JSON array in the response
+    match = re.search(r'\[.*\]', response, re.DOTALL)
     if match:
         try:
-            positions = json.loads(match.group())
-            if isinstance(positions, list) and len(positions) >= 2:
-                return [float(z) for z in positions]
+            specs = json.loads(match.group())
+            if isinstance(specs, list) and len(specs) >= 2:
+                # Normalize: if items are plain numbers, treat as Z positions
+                if all(isinstance(s, (int, float)) for s in specs):
+                    return [{"z": float(s)} for s in specs]
+                if all(isinstance(s, dict) for s in specs):
+                    return specs
         except (json.JSONDecodeError, ValueError):
             pass
-    print(f"  WARNING: Could not parse Z positions from model response, using fallback.")
+
+    print(f"  WARNING: Could not parse view specs from model response, using fallback.")
     print(f"  Model said: {response}")
-    return FALLBACK_Z_POSITIONS
+    # Fallback: 5 evenly spaced Z slices
+    z_max = DATA_SHAPE[2] - 1
+    return [{"z": round(z_max * i / 4)} for i in range(5)]
 
 
 def main():
@@ -205,52 +232,60 @@ def main():
     print("\n[1/5] Loading Molmo2-O-7B ...")
     model, processor = load_model(CHECKPOINT)
 
-    # ── 2. Parse NG link ─────────────────────────────────────────────────
-    print("\n[2/5] Reading Neuroglancer link ...")
+    # ── 2. Read inputs ──────────────────────────────────────────────────
+    print("\n[2/5] Reading inputs ...")
     raw_link = Path(NG_LINK_FILE).read_text().strip()
-    print(f"  Link file: {NG_LINK_FILE}")
+    print(f"  NG link file: {NG_LINK_FILE}")
     print(f"  Data shape: {DATA_SHAPE[0]}x{DATA_SHAPE[1]}x{DATA_SHAPE[2]} (XYZ)")
+    print(f"  Question: {QUESTION}")
 
-    # ── 3. Plan Z positions ──────────────────────────────────────────────
-    print("\n[3/5] Planning Z positions (text-only call) ...")
+    # ── 3. Plan views ────────────────────────────────────────────────────
+    print("\n[3/5] Planning views (text-only call) ...")
     plan_prompt = (
-        f"You are analyzing a 3D fluorescence microscopy brain tissue dataset.\n"
+        f"You are analyzing a 3D dataset displayed in a Neuroglancer web viewer.\n"
         f"The data volume has shape X={DATA_SHAPE[0]}, Y={DATA_SHAPE[1]}, Z={DATA_SHAPE[2]} voxels.\n"
-        f"The web viewer shows one 2D XY slice at a time.\n"
-        f"To count neurons, you need to examine multiple Z-depth slices "
-        f"spanning the full Z range (0 to {DATA_SHAPE[2]-1}).\n\n"
-        f"Output a JSON list of Z positions to screenshot, e.g. [10, 50, 100, 150, 200].\n"
-        f"Choose positions that evenly span the Z range to get a representative sample.\n"
+        f"The viewer shows a 2D cross-section at a given position.\n"
+        f"You can control which slice to view by setting the position along X, Y, or Z.\n"
+        f"The default view is an XY cross-section (looking down the Z axis).\n\n"
+        f"Your task is to answer this question about the data:\n"
+        f"  \"{QUESTION}\"\n\n"
+        f"Plan a set of views (screenshots) you need to examine to answer this question.\n"
+        f"Output a JSON list of view specifications. Each view is an object with:\n"
+        f"  - \"z\": Z position (0 to {DATA_SHAPE[2]-1})\n"
+        f"  - optionally \"x\", \"y\" to shift the XY center\n"
+        f"  - optionally \"layout\": \"xy\", \"xz\", or \"yz\" for different cross-sections\n\n"
+        f"Example: [{{\"z\": 10}}, {{\"z\": 50}}, {{\"z\": 100}}, {{\"z\": 150}}, {{\"z\": 200}}]\n"
+        f"Choose views that will give you the information needed to answer the question.\n"
         f"Output ONLY the JSON list, nothing else."
     )
     plan_response = ask_text(model, processor, plan_prompt)
     print(f"  Model response: {plan_response}")
 
-    z_positions = parse_z_positions(plan_response)
-    print(f"  Z positions to screenshot: {z_positions}")
+    view_specs = parse_view_specs(plan_response)
+    print(f"  Planned {len(view_specs)} views: {view_specs}")
 
-    # ── 4. Screenshot each Z position ────────────────────────────────────
+    # ── 4. Screenshot each view ──────────────────────────────────────────
     print("\n[4/5] Taking screenshots ...")
-    urls_with_meta = build_view_urls(raw_link, z_positions)
+    urls_with_meta = build_view_urls(raw_link, view_specs)
     screenshots = take_screenshots(urls_with_meta)
 
     # ── 5. Interpret each screenshot ─────────────────────────────────────
     print("\n[5/5] Interpreting screenshots ...")
     findings = []
     for i, (img, meta) in enumerate(screenshots):
-        print(f"\n  --- Slice {i+1}/{len(screenshots)}: Z={meta['z']} ---")
+        print(f"\n  --- View {i+1}/{len(screenshots)}: "
+              f"{meta['layout']} at ({meta['x']:.0f}, {meta['y']:.0f}, {meta['z']:.0f}) ---")
         interpret_prompt = (
-            f"You are viewing a fluorescence microscopy cross-section of brain tissue.\n"
-            f"Position: X={meta['x']:.1f}, Y={meta['y']:.1f}, Z={meta['z']:.0f}.\n"
-            f"Bright spots are individual neuron cell bodies.\n\n"
-            f"Count the number of visible neurons in this image. Report:\n"
-            f"1. The count of distinct bright spots (neurons) you can identify\n"
-            f"2. A brief description of their distribution "
-            f"(clustered, scattered, dense, sparse)\n\n"
-            f"Be specific with the count — give a number, not a range."
+            f"You are viewing a cross-section of a 3D dataset in a Neuroglancer viewer.\n"
+            f"View: {meta['layout']} cross-section at position "
+            f"X={meta['x']:.0f}, Y={meta['y']:.0f}, Z={meta['z']:.0f}.\n"
+            f"Data shape: {DATA_SHAPE[0]}x{DATA_SHAPE[1]}x{DATA_SHAPE[2]} voxels (XYZ).\n\n"
+            f"You are trying to answer this question: \"{QUESTION}\"\n\n"
+            f"Describe what you see in this view that is relevant to answering the question.\n"
+            f"Be specific with any counts or measurements."
         )
         response = ask_vision(model, processor, img, interpret_prompt)
-        findings.append({"z": meta["z"], "response": response})
+        findings.append({"view": i, "meta": meta, "response": response})
         print(f"  {response}")
 
     # ── 6. Synthesize final answer ───────────────────────────────────────
@@ -259,17 +294,17 @@ def main():
     print("=" * 60)
 
     findings_text = "\n".join(
-        f"Z={f['z']:.0f}: {f['response']}" for f in findings
+        f"View {f['view']+1} ({f['meta']['layout']} at Z={f['meta']['z']:.0f}): {f['response']}"
+        for f in findings
     )
     synth_prompt = (
-        f"You examined {len(findings)} Z-slices of a 3D fluorescence microscopy "
-        f"brain volume (shape {DATA_SHAPE[0]}x{DATA_SHAPE[1]}x{DATA_SHAPE[2]}).\n"
-        f"Here are your per-slice neuron count findings:\n\n"
+        f"You examined {len(findings)} views of a 3D dataset "
+        f"(shape {DATA_SHAPE[0]}x{DATA_SHAPE[1]}x{DATA_SHAPE[2]} voxels, XYZ).\n\n"
+        f"Question: \"{QUESTION}\"\n\n"
+        f"Here are your observations from each view:\n\n"
         f"{findings_text}\n\n"
-        f"Based on these observations, estimate the total number of unique neurons "
-        f"in the volume. Account for the fact that some neurons span multiple "
-        f"Z-slices (typical neuron diameter is ~10-20 voxels in Z).\n"
-        f"Give a final count estimate and explain your reasoning."
+        f"Based on all your observations, provide a final answer to the question.\n"
+        f"Explain your reasoning."
     )
     final_answer = ask_text(model, processor, synth_prompt, max_new_tokens=1024)
 
@@ -279,8 +314,8 @@ def main():
     (RESULTS_DIR / "answer.txt").write_text(final_answer)
     (RESULTS_DIR / "findings.json").write_text(json.dumps(findings, indent=2))
     print(f"\nResults saved to {RESULTS_DIR}/")
-    print(f"  answer.txt     — final neuron count estimate")
-    print(f"  findings.json  — per-slice findings")
+    print(f"  answer.txt     — final answer")
+    print(f"  findings.json  — per-view findings")
     print(f"  screenshots/   — {len(screenshots)} PNG files")
 
 
