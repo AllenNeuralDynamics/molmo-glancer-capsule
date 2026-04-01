@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# _dev_startup2.sh — Install v2 project dependencies
+# _dev_startup.sh — Install v3 project dependencies
 #
 # Run once at capsule startup (after /code is mounted).
 # The Docker image provides: Python 3.12, PyTorch+CUDA, boto3, ai2-olmo-core.
 # This script installs everything else needed for the v2 pipeline.
 #
-# v2 stack:
-#   - Molmo2-O-7B via HuggingFace transformers (VQA + orchestration, single model)
+# v3 stack:
+#   - Molmo2-O-7B via HuggingFace transformers (agent loop, vision + video)
 #   - NeuroglancerState (neuroglancer-chat, URL builder only)
-#   - Playwright (headless screenshots)
+#   - Playwright (headless screenshots + scan frames)
+#   - zarr/s3fs (volume metadata discovery)
+#   - imageio (scan video artifacts)
 #
 # Usage:
-#   bash /code/_dev_startup2.sh
+#   bash /code/_dev_startup.sh
 
 set -euo pipefail
 
@@ -75,7 +77,8 @@ echo "--- utility deps ---"
     httpx \
     zarr \
     s3fs \
-    scikit-image
+    scikit-image \
+    imageio[ffmpeg]
 
 # ---------------------------------------------------------------------------
 # neuroglancer-chat — editable install, no deps
@@ -93,5 +96,5 @@ echo " Setup complete."
 echo ""
 echo " Next: download model weights:"
 echo "   export HF_TOKEN=hf_..."
-echo "   bash /code/_download_weights_v2.sh"
+echo "   bash /code/_download_weights.sh"
 echo "=========================================="
