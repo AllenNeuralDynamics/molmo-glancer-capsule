@@ -71,8 +71,8 @@ def load_model(checkpoint: str):
     return model, processor
 
 
-def ask_text(model, processor, prompt: str, max_new_tokens: int = 512) -> str:
-    """Text-only call to Molmo2 (no image). Returns generated text."""
+def ask_text(model, processor, prompt: str, max_new_tokens: int = 512):
+    """Text-only call to Molmo2 (no image). Returns (text, token_counts)."""
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     inputs = processor.apply_chat_template(
         messages, tokenize=True,
@@ -80,15 +80,18 @@ def ask_text(model, processor, prompt: str, max_new_tokens: int = 512) -> str:
         return_tensors="pt", return_dict=True,
     )
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    input_len = inputs["input_ids"].shape[1]
     with torch.inference_mode():
         output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
-    generated = output_ids[0, inputs["input_ids"].shape[1]:]
-    return processor.tokenizer.decode(generated, skip_special_tokens=True).strip()
+    generated = output_ids[0, input_len:]
+    output_len = len(generated)
+    text = processor.tokenizer.decode(generated, skip_special_tokens=True).strip()
+    return text, {"input_tokens": input_len, "output_tokens": output_len}
 
 
 def ask_vision(model, processor, image: Image.Image, prompt: str,
-               max_new_tokens: int = 512) -> str:
-    """Image+text call to Molmo2. Returns generated text."""
+               max_new_tokens: int = 512):
+    """Image+text call to Molmo2. Returns (text, token_counts)."""
     # Resize to limit vision token count for memory stability
     max_side = 512
     if max(image.size) > max_side:
@@ -104,10 +107,13 @@ def ask_vision(model, processor, image: Image.Image, prompt: str,
         return_tensors="pt", return_dict=True,
     )
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    input_len = inputs["input_ids"].shape[1]
     with torch.inference_mode():
         output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
-    generated = output_ids[0, inputs["input_ids"].shape[1]:]
-    return processor.tokenizer.decode(generated, skip_special_tokens=True).strip()
+    generated = output_ids[0, input_len:]
+    output_len = len(generated)
+    text = processor.tokenizer.decode(generated, skip_special_tokens=True).strip()
+    return text, {"input_tokens": input_len, "output_tokens": output_len}
 
 
 # ── NeuroglancerState URL generation ─────────────────────────────────────────
@@ -202,27 +208,55 @@ def parse_view_specs(response: str) -> list[dict]:
 
     Expects a JSON array of objects, e.g.:
         [{"z": 10}, {"z": 50}, {"z": 100}]
-    Falls back to evenly spaced Z slices if parsing fails.
+    Raises ValueError if parsing fails — no silent fallback.
     """
-    # Find a JSON array in the response
     match = re.search(r'\[.*\]', response, re.DOTALL)
-    if match:
+
+    # If no closing ']', the model likely hit the token limit mid-array.
+    # Try to repair by finding '[' and truncating to the last complete item.
+    if not match:
+        bracket = response.find('[')
+        if bracket == -1:
+            raise ValueError(f"No JSON array found in model response:\n  {response}")
+        truncated = response[bracket:]
+        # Strip any trailing partial object/comma and close the array
+        truncated = re.sub(r',\s*(\{[^}]*)?$', '', truncated)
+        truncated = truncated.rstrip().rstrip(',') + ']'
+        print(f"  WARNING: JSON array was truncated (likely hit token limit), repaired.")
+        try:
+            specs = json.loads(truncated)
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ValueError(f"Could not repair truncated JSON: {e}\n  {response}")
+    else:
         try:
             specs = json.loads(match.group())
-            if isinstance(specs, list) and len(specs) >= 2:
-                # Normalize: if items are plain numbers, treat as Z positions
-                if all(isinstance(s, (int, float)) for s in specs):
-                    return [{"z": float(s)} for s in specs]
-                if all(isinstance(s, dict) for s in specs):
-                    return specs
-        except (json.JSONDecodeError, ValueError):
-            pass
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ValueError(f"Invalid JSON in model response: {e}\n  {response}")
 
-    print(f"  WARNING: Could not parse view specs from model response, using fallback.")
-    print(f"  Model said: {response}")
-    # Fallback: 5 evenly spaced Z slices
-    z_max = DATA_SHAPE[2] - 1
-    return [{"z": round(z_max * i / 4)} for i in range(5)]
+    if not isinstance(specs, list) or len(specs) == 0:
+        raise ValueError(f"Expected non-empty JSON list, got: {specs}")
+
+    # Normalize: plain numbers → z positions, anything else → must be dicts
+    normalized = []
+    for item in specs:
+        if isinstance(item, (int, float)):
+            normalized.append({"z": float(item)})
+        elif isinstance(item, dict):
+            normalized.append(item)
+        else:
+            raise ValueError(f"Unexpected item in view specs: {item}")
+
+    # Clamp coordinates to valid data ranges
+    x_max, y_max, z_max = DATA_SHAPE[0] - 1, DATA_SHAPE[1] - 1, DATA_SHAPE[2] - 1
+    for spec in normalized:
+        if "x" in spec:
+            spec["x"] = max(0, min(float(spec["x"]), x_max))
+        if "y" in spec:
+            spec["y"] = max(0, min(float(spec["y"]), y_max))
+        if "z" in spec:
+            spec["z"] = max(0, min(float(spec["z"]), z_max))
+
+    return normalized
 
 
 def main():
@@ -239,58 +273,142 @@ def main():
     print(f"  Data shape: {DATA_SHAPE[0]}x{DATA_SHAPE[1]}x{DATA_SHAPE[2]} (XYZ)")
     print(f"  Question: {QUESTION}")
 
-    # ── 3. Plan views ────────────────────────────────────────────────────
-    print("\n[3/5] Planning views (text-only call) ...")
-    plan_prompt = (
-        f"You are analyzing a 3D dataset displayed in a Neuroglancer web viewer.\n"
+    # Token usage tracking
+    token_usage = {"steps": [], "totals": {"input_tokens": 0, "output_tokens": 0}}
+
+    def track(step_name, tokens, call_type="text"):
+        """Record token counts for a step/sub-step."""
+        entry = {"step": step_name, "type": call_type, **tokens}
+        token_usage["steps"].append(entry)
+        token_usage["totals"]["input_tokens"] += tokens["input_tokens"]
+        token_usage["totals"]["output_tokens"] += tokens["output_tokens"]
+        print(f"    [{tokens['input_tokens']} in / {tokens['output_tokens']} out tokens]")
+
+    # ── 3. Strategy — what to look for ───────────────────────────────────
+    print("\n[3/9] Strategy — what visual features to look for (text-only) ...")
+    strategy_prompt = (
+        f"You are analyzing a 3D microscopy dataset displayed in a Neuroglancer web viewer.\n"
         f"The data volume has shape X={DATA_SHAPE[0]}, Y={DATA_SHAPE[1]}, Z={DATA_SHAPE[2]} voxels.\n"
-        f"The viewer shows a 2D cross-section at a given position.\n"
-        f"You can control which slice to view by setting the position along X, Y, or Z.\n"
-        f"The default view is an XY cross-section (looking down the Z axis).\n\n"
-        f"Your task is to answer this question about the data:\n"
+        f"Neuroglancer shows 2D cross-sections of 3D data. You can view XY, XZ, or YZ planes\n"
+        f"at any position in the volume.\n\n"
+        f"You need to answer this question:\n"
         f"  \"{QUESTION}\"\n\n"
-        f"Plan a set of views (screenshots) you need to examine to answer this question.\n"
-        f"Output a JSON list of view specifications. Each view is an object with:\n"
-        f"  - \"z\": Z position (0 to {DATA_SHAPE[2]-1})\n"
-        f"  - optionally \"x\", \"y\" to shift the XY center\n"
-        f"  - optionally \"layout\": \"xy\", \"xz\", or \"yz\" for different cross-sections\n\n"
-        f"Example: [{{\"z\": 10}}, {{\"z\": 50}}, {{\"z\": 100}}, {{\"z\": 150}}, {{\"z\": 200}}]\n"
-        f"Choose views that will give you the information needed to answer the question.\n"
-        f"Output ONLY the JSON list, nothing else."
+        f"What visual features, patterns, or structures should you look for in the images\n"
+        f"to answer this question? Think about what would be visible in 2D cross-sections.\n"
+        f"Be specific about what to look for and why.\n\n"
+        f"Your response will be fed directly into the next step of an automated pipeline.\n"
+        f"Write a concise, structured list of features — no preamble or filler."
     )
-    plan_response = ask_text(model, processor, plan_prompt)
+    strategy, tokens = ask_text(model, processor, strategy_prompt, max_new_tokens=1024)
+    track("3_strategy", tokens)
+    print(f"  Strategy: {strategy}")
+
+    # ── 4. Approach — how to look for those features ────────────────────
+    print("\n[4/9] Approach — how to observe those features in Neuroglancer (text-only) ...")
+    approach_prompt = (
+        f"You are analyzing a 3D dataset in Neuroglancer.\n"
+        f"Volume shape: X={DATA_SHAPE[0]}, Y={DATA_SHAPE[1]}, Z={DATA_SHAPE[2]} voxels.\n"
+        f"You can view XY, XZ, or YZ cross-sections at any position in the volume.\n\n"
+        f"Question: \"{QUESTION}\"\n\n"
+        f"You identified these features to look for:\n"
+        f"  {strategy}\n\n"
+        f"Now describe HOW to observe those features using 2D cross-sections.\n"
+        f"Consider: which orientations (XY, XZ, YZ) reveal the features best?\n"
+        f"Which regions of the volume (top, middle, bottom, edges, center) are most\n"
+        f"informative? Should you sample densely or sparsely? Do you need multiple\n"
+        f"orientations to disambiguate 3D structure from 2D slices?\n\n"
+        f"Your response will be fed directly into the next step to produce a concrete\n"
+        f"list of view coordinates. Write a concise, actionable viewing plan — no filler."
+    )
+    approach, tokens = ask_text(model, processor, approach_prompt, max_new_tokens=1024)
+    track("4_approach", tokens)
+    print(f"  Approach: {approach}")
+
+    # ── 5. Plan views — concrete view list ───────────────────────────────
+    print("\n[5/9] Planning views — concrete view specifications (text-only) ...")
+    plan_prompt = (
+        f"TASK: Output a JSON list of 4-16 views to screenshot in Neuroglancer.\n\n"
+        f"CONSTRAINTS:\n"
+        f"  - Volume shape: X=0..{DATA_SHAPE[0]-1}, Y=0..{DATA_SHAPE[1]-1}, Z=0..{DATA_SHAPE[2]-1}\n"
+        f"  - Each view: {{\"z\": <int>}} with optional \"x\", \"y\", \"layout\" (\"xy\"|\"xz\"|\"yz\")\n"
+        f"  - All coordinates must be within the volume bounds above\n"
+        f"  - Output 4 to 16 views total\n\n"
+        f"CONTEXT:\n"
+        f"  Question: \"{QUESTION}\"\n"
+        f"  Features: {strategy}\n"
+        f"  Approach: {approach}\n\n"
+        f"EXAMPLE OUTPUT:\n"
+        f"[{{\"z\": 10}}, {{\"z\": 40, \"layout\": \"xz\"}}, {{\"z\": 85}}, {{\"z\": 130, \"x\": 200, \"y\": 300}}, {{\"z\": 190, \"layout\": \"yz\"}}]\n\n"
+        f"Output ONLY the JSON list. No text before or after."
+    )
+    plan_response, tokens = ask_text(model, processor, plan_prompt, max_new_tokens=1024)
+    track("5_plan_views", tokens)
     print(f"  Model response: {plan_response}")
 
     view_specs = parse_view_specs(plan_response)
     print(f"  Planned {len(view_specs)} views: {view_specs}")
 
-    # ── 4. Screenshot each view ──────────────────────────────────────────
-    print("\n[4/5] Taking screenshots ...")
+    # ── 6. Per-view guidance — what to look for in each view ────────────
+    print("\n[6/9] Per-view guidance — what to look for in each view (text-only) ...")
+    view_guidances = []
+    for i, spec in enumerate(view_specs):
+        layout = spec.get("layout", "xy")
+        z = spec.get("z", DATA_SHAPE[2] / 2)
+        x = spec.get("x", DATA_SHAPE[0] / 2)
+        y = spec.get("y", DATA_SHAPE[1] / 2)
+        view_label = f"{layout} at ({x:.0f}, {y:.0f}, {z:.0f})"
+        print(f"\n  --- View {i+1}/{len(view_specs)}: {view_label} ---")
+
+        guidance_prompt = (
+            f"You are about to examine a screenshot of a {layout} cross-section\n"
+            f"at position X={x:.0f}, Y={y:.0f}, Z={z:.0f}\n"
+            f"in a 3D microscopy dataset ({DATA_SHAPE[0]}x{DATA_SHAPE[1]}x{DATA_SHAPE[2]} voxels).\n\n"
+            f"Question: \"{QUESTION}\"\n"
+            f"Features to look for: {strategy}\n"
+            f"Viewing approach: {approach}\n\n"
+            f"Given this specific view's position and orientation, what exactly should\n"
+            f"you look for in the image?\n\n"
+            f"Your response will be passed directly as instructions to guide visual\n"
+            f"interpretation of the screenshot. Write a short, concrete checklist — no filler."
+        )
+        guidance, tokens = ask_text(model, processor, guidance_prompt, max_new_tokens=512)
+        track(f"6_guidance_view_{i}", tokens)
+        view_guidances.append(guidance)
+        print(f"  Guidance: {guidance}")
+
+    # ── 7. Screenshot each view ──────────────────────────────────────────
+    print("\n[7/9] Taking screenshots ...")
     urls_with_meta = build_view_urls(raw_link, view_specs)
     screenshots = take_screenshots(urls_with_meta)
 
-    # ── 5. Interpret each screenshot ─────────────────────────────────────
-    print("\n[5/5] Interpreting screenshots ...")
+    # ── 8. Visual interpretation — guided by per-view instructions ───────
+    print("\n[8/9] Interpreting screenshots ...")
     findings = []
     for i, (img, meta) in enumerate(screenshots):
-        print(f"\n  --- View {i+1}/{len(screenshots)}: "
-              f"{meta['layout']} at ({meta['x']:.0f}, {meta['y']:.0f}, {meta['z']:.0f}) ---")
-        interpret_prompt = (
-            f"You are viewing a cross-section of a 3D dataset in a Neuroglancer viewer.\n"
-            f"View: {meta['layout']} cross-section at position "
-            f"X={meta['x']:.0f}, Y={meta['y']:.0f}, Z={meta['z']:.0f}.\n"
-            f"Data shape: {DATA_SHAPE[0]}x{DATA_SHAPE[1]}x{DATA_SHAPE[2]} voxels (XYZ).\n\n"
-            f"You are trying to answer this question: \"{QUESTION}\"\n\n"
-            f"Describe what you see in this view that is relevant to answering the question.\n"
-            f"Be specific with any counts or measurements."
-        )
-        response = ask_vision(model, processor, img, interpret_prompt)
-        findings.append({"view": i, "meta": meta, "response": response})
-        print(f"  {response}")
+        view_label = (f"{meta['layout']} at "
+                      f"({meta['x']:.0f}, {meta['y']:.0f}, {meta['z']:.0f})")
+        print(f"\n  --- View {i+1}/{len(screenshots)}: {view_label} ---")
 
-    # ── 6. Synthesize final answer ───────────────────────────────────────
+        interpret_prompt = (
+            f"You are viewing a {meta['layout']} cross-section of a 3D microscopy dataset\n"
+            f"in Neuroglancer at position X={meta['x']:.0f}, Y={meta['y']:.0f}, Z={meta['z']:.0f}.\n"
+            f"Data shape: {DATA_SHAPE[0]}x{DATA_SHAPE[1]}x{DATA_SHAPE[2]} voxels (XYZ).\n\n"
+            f"Question: \"{QUESTION}\"\n\n"
+            f"What to look for in this view:\n"
+            f"  {view_guidances[i]}\n\n"
+            f"Describe what you see that is relevant to the question.\n"
+            f"Be specific with any counts, measurements, or spatial patterns.\n\n"
+            f"Your response will be collected with other views and fed to a final synthesis\n"
+            f"step. Write structured observations — no filler or repetition of the instructions."
+        )
+        response, tokens = ask_vision(model, processor, img, interpret_prompt, max_new_tokens=1024)
+        track(f"8_interpret_view_{i}", tokens, call_type="vision")
+        findings.append({"view": i, "meta": meta, "guidance": view_guidances[i], "response": response})
+        print(f"  Interpretation: {response}")
+
+    # ── 9. Synthesize final answer ───────────────────────────────────────
     print("\n" + "=" * 60)
-    print("Synthesizing final answer ...")
+    print("[9/9] Synthesizing final answer ...")
     print("=" * 60)
 
     findings_text = "\n".join(
@@ -298,25 +416,31 @@ def main():
         for f in findings
     )
     synth_prompt = (
-        f"You examined {len(findings)} views of a 3D dataset "
+        f"You examined {len(findings)} views of a 3D microscopy dataset "
         f"(shape {DATA_SHAPE[0]}x{DATA_SHAPE[1]}x{DATA_SHAPE[2]} voxels, XYZ).\n\n"
         f"Question: \"{QUESTION}\"\n\n"
+        f"Your strategy was: {strategy}\n\n"
         f"Here are your observations from each view:\n\n"
         f"{findings_text}\n\n"
-        f"Based on all your observations, provide a final answer to the question.\n"
+        f"Based on all your observations and strategy, provide a final answer to the question.\n"
         f"Explain your reasoning."
     )
-    final_answer = ask_text(model, processor, synth_prompt, max_new_tokens=1024)
+    final_answer, tokens = ask_text(model, processor, synth_prompt, max_new_tokens=2048)
+    track("9_synthesize", tokens)
 
     print(f"\n{final_answer}")
 
     # ── Save outputs ─────────────────────────────────────────────────────
     (RESULTS_DIR / "answer.txt").write_text(final_answer)
     (RESULTS_DIR / "findings.json").write_text(json.dumps(findings, indent=2))
+    (RESULTS_DIR / "token_usage.json").write_text(json.dumps(token_usage, indent=2))
     print(f"\nResults saved to {RESULTS_DIR}/")
-    print(f"  answer.txt     — final answer")
-    print(f"  findings.json  — per-view findings")
-    print(f"  screenshots/   — {len(screenshots)} PNG files")
+    print(f"  answer.txt       — final answer")
+    print(f"  findings.json    — per-view findings")
+    print(f"  token_usage.json — per-step token counts")
+    print(f"  screenshots/     — {len(screenshots)} PNG files")
+    print(f"\nToken totals: {token_usage['totals']['input_tokens']} input, "
+          f"{token_usage['totals']['output_tokens']} output")
 
 
 if __name__ == "__main__":

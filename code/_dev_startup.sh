@@ -33,7 +33,7 @@ echo "--- pip upgrade ---"
 echo ""
 echo "--- Molmo2 inference stack ---"
 "$PIP" install -q --no-cache-dir \
-    "transformers>=4.57.1" \
+    "transformers>=4.57.1,<5.0.0" \
     bitsandbytes \
     accelerate \
     einops \
