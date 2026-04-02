@@ -104,15 +104,15 @@ class VolumeInfo:
         if self.anisotropy_ratio > 1.5:
             lines.append(f"Note: z is {self.anisotropy_ratio:.1f}\u00d7 coarser than x/y")
 
-        # Per-layer listing
+        # Per-layer listing (numbered for use with "show" key)
         lines.append("Layers:")
-        for l in self.layers:
+        for i, l in enumerate(self.layers, 1):
             vis = "visible" if l.visible else "hidden"
             if l.extent:
                 ext = f"{l.extent[0]:.0f}\u00d7{l.extent[1]:.0f}\u00d7{l.extent[2]:.0f} {units}"
             else:
                 ext = "extent unknown"
-            lines.append(f"  - {l.name} ({l.type}, {ext}) [{vis}]")
+            lines.append(f"  {i}. {l.name} ({l.type}, {ext}) [{vis}]")
 
         lines.append(f"Center: x={cx:.1f}, y={cy:.1f}, z={cz:.1f}")
         lines.append(f"Ranges: x=[0..{s[0]:.0f}], y=[0..{s[1]:.0f}], z=[0..{s[2]:.0f}]")

@@ -305,6 +305,8 @@ def execute_scan(base_state, scan_spec: dict, volume_info, config: dict, scan_id
                 view_spec["projectionOrientation"] = scan_spec["orientations"][i]
             else:
                 view_spec["projectionOrientation"] = scan_spec["projectionOrientation"]
+        if "layerVisibility" in scan_spec:
+            view_spec["layerVisibility"] = scan_spec["layerVisibility"]
         states.append(build_clean_state(base_state, view_spec, volume_info))
 
     max_side = config.get("max_image_side")

@@ -321,11 +321,37 @@ def parse_action(model_output: str) -> dict | None:
     return None
 
 
+def _resolve_show(action: dict, volume_info: VolumeInfo):
+    """Convert "show": [1, 2] to layerVisibility dict using layer numbers."""
+    show = action.pop("show", None)
+    if show is None:
+        # Also check inside view dict for screenshots
+        view = action.get("view", {})
+        show = view.pop("show", None)
+    if show is None:
+        return
+
+    # Build visibility dict: listed numbers are visible, all others hidden
+    show_set = set(show) if isinstance(show, list) else {show}
+    layer_vis = {}
+    for i, layer in enumerate(volume_info.layers, 1):
+        layer_vis[layer.name] = (i in show_set)
+
+    # Store in the right place
+    if action.get("action") == "screenshot":
+        action.setdefault("view", {})["layerVisibility"] = layer_vis
+    else:
+        action["layerVisibility"] = layer_vis
+
+
 def validate_action(action: dict, volume_info: VolumeInfo) -> dict:
     """Validate and normalize an action dict. Resolves zoom names, clamps positions."""
     action_type = action.get("action", "")
 
     if action_type in ("screenshot", "scan", "count"):
+        # ── Resolve "show" layer numbers to layerVisibility ────────
+        _resolve_show(action, volume_info)
+
         # ── Resolve zoom name to crossSectionScale ──────────────────
         # The model sends "zoom": "fit" etc., we translate to a float.
         # Check both the action top-level (scans) and view dict (screenshots).
@@ -476,10 +502,9 @@ You must respond with exactly one JSON object. Available actions:
 LAYOUT: "xy", "xz", "yz", "4panel"
 NOTE: Do NOT use "3d" layout — it renders only a wireframe bounding box for raw image data, not the actual voxel data.
 
-OPTIONAL VIEW KEYS (for screenshot, scan, and count):
-  "layerVisibility": {{"layer name": true, "other layer": false}}  — toggle layers on/off
+OPTIONAL KEYS (for screenshot, scan, and count):
+  "show": [1, 2]  — which layers to show (by number from the Layers list above). Omit to keep current visibility.
   "shaderRange": [vmin, vmax]  — adjust brightness/contrast for image layers
-  "layerColors": {{"layer name": "#FF0000"}}  — set layer color (hex RGB)
 
 IMPORTANT: Zooms below "full" CROP the view — you will miss data outside the visible area.
 
