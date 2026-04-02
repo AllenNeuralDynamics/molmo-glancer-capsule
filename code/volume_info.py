@@ -15,9 +15,9 @@ VIEWPORT_SIZE = 1024
 ZOOM_LEVELS = {
     "wide":         2.0,    # zoomed out, all data visible with margin
     "full":         1.0,    # data fills the screen
-    "region":       0.5,    # a region of the data, some edges not visible
-    "neurons":      0.25,   # good for seeing and counting individual neurons
-    "single-cell":  0.125,  # zoomed in on individual cells, fine detail
+    "region":       0.5,    # CROPS: ~half the data visible, edges excluded
+    "close-up":     0.25,   # CROPS: ~quarter visible, most data excluded
+    "single-cell":  0.125,  # CROPS: tiny fraction visible, nearly all data excluded
 }
 
 
@@ -52,11 +52,12 @@ def resolve_zoom(zoom_name: str, volume_info: "VolumeInfo") -> float:
 def format_zoom_table() -> str:
     """Format the zoom options for inclusion in the prompt."""
     return """ZOOM OPTIONS (use one of these names for "zoom"):
-  "wide" — zoomed out, all data visible
-  "full" — data fills the screen
-  "region" — a region of the data
-  "neurons" — see and count individual neurons
-  "single-cell" — zoomed in on fine cell detail"""
+  "wide"        — zoomed out, entire volume visible with margin (~2× FOV)
+  "full"        — entire volume fills the screen; use this to survey the full population
+  --- below "full", the view CROPS the data — you will NOT see everything ---
+  "region"      — ⚠ CROPS to ~half the volume; edges are excluded from view
+  "close-up"    — ⚠ CROPS to ~quarter; most of the data is NOT visible
+  "single-cell" — ⚠ CROPS to a tiny area; nearly all data excluded, for fine detail only"""
 
 
 @dataclass

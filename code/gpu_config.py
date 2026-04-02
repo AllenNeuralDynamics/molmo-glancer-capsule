@@ -24,7 +24,7 @@ GPU_PROFILES = {
         "torch_dtype": torch.float16,
         "max_image_side": None,         # no downscale
         "max_crops": 8,                 # 24 on demand for detail
-        "max_scan_frames": 200,
+        "max_scan_frames": 50,
         "max_agent_iterations": 20,
         "max_context_tokens": 55000,
     },
