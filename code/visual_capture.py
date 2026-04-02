@@ -54,8 +54,8 @@ def build_clean_state(base_state, view_spec: dict, volume_info=None):
 
     # ── Overlay hiding ──────────────────────────────────────────────────
     d["showAxisLines"] = False
-    d["showScaleBar"] = False
-    d["showDefaultAnnotations"] = False
+    d["showScaleBar"] = True             # keep scale bar for physical size reference
+    d["showDefaultAnnotations"] = True   # yellow bounding box — shows data extent
     d["crossSectionBackgroundColor"] = "#000000"
     d["selectedLayer"] = {"visible": False}
     d["statistics"] = {"visible": False}
@@ -86,6 +86,10 @@ def build_clean_state(base_state, view_spec: dict, volume_info=None):
     # ── Zoom ────────────────────────────────────────────────────────────
     if "crossSectionScale" in view_spec:
         d["crossSectionScale"] = float(view_spec["crossSectionScale"])
+    elif volume_info is not None:
+        # Default: 2x fit — data fills ~half the viewport, shows some surrounding context
+        fit_scale = max(volume_info.shape[0], volume_info.shape[1]) / VIEWPORT_SIZE
+        d["crossSectionScale"] = fit_scale * 2
     if "projectionScale" in view_spec:
         d["projectionScale"] = float(view_spec["projectionScale"])
 
@@ -128,18 +132,18 @@ def capture_screenshot(page, state, config: dict, screenshot_id: int) -> Image.I
     url = state.to_url()
     print(f"  Navigating to NG URL ({len(url)} chars) ...")
 
-    page.goto(url, wait_until="domcontentloaded")
+    page.goto(url, wait_until="networkidle")
 
     # Inject CSS to hide UI chrome
     page.add_style_tag(content=NG_HIDE_CSS)
 
-    # Wait for data to load via viewer.isReady() polling
+    # Wait for viewer to signal data is rendered
     try:
-        page.wait_for_function(NG_READY_JS, timeout=30000)
+        page.wait_for_function(NG_READY_JS, timeout=15000)
         print("  viewer.isReady() = true")
     except Exception:
-        print("  WARNING: viewer.isReady() timed out after 30s, falling back to sleep")
-        time.sleep(12)
+        print("  WARNING: viewer.isReady() timed out after 15s, falling back to sleep")
+        time.sleep(3)
 
     # Capture canvas only
     canvas = page.locator("canvas").first
@@ -218,18 +222,23 @@ def execute_scan(page, base_state, scan_spec: dict, volume_info, config: dict, s
         if i == 0:
             # First frame: full navigation
             url = state.to_url()
-            page.goto(url, wait_until="domcontentloaded")
+            page.goto(url, wait_until="networkidle")
             page.add_style_tag(content=NG_HIDE_CSS)
+            try:
+                page.wait_for_function(NG_READY_JS, timeout=10000)
+            except Exception:
+                time.sleep(2)
         else:
-            # Subsequent frames: hash-fragment update (faster)
+            # Subsequent frames: hash-fragment update (faster, data cached)
             state_json = json.dumps(state.data, separators=(",", ":"))
             page.evaluate("(h) => { location.hash = '!' + h }", state_json)
+            try:
+                page.wait_for_function(NG_READY_JS, timeout=3000)
+            except Exception:
+                time.sleep(0.5)
 
-        # Wait for data
-        try:
-            page.wait_for_function(NG_READY_JS, timeout=15000)
-        except Exception:
-            time.sleep(3)
+        if (i + 1) % 5 == 0 or i == 0:
+            print(f"    frame {i+1}/{len(positions)}")
 
         canvas = page.locator("canvas").first
         png_bytes = canvas.screenshot()

@@ -10,6 +10,54 @@ from dataclasses import dataclass, field
 
 VIEWPORT_SIZE = 1024
 
+# Named zoom levels — the model picks one of these instead of a raw float.
+# Defined as multipliers of fit_scale (which fills the full data extent).
+ZOOM_LEVELS = {
+    "wide":         2.0,    # zoomed out, all data visible with margin
+    "full":         1.0,    # data fills the screen
+    "region":       0.5,    # a region of the data, some edges not visible
+    "neurons":      0.25,   # good for seeing and counting individual neurons
+    "single-cell":  0.125,  # zoomed in on individual cells, fine detail
+}
+
+
+def build_zoom_table(volume_info: "VolumeInfo") -> dict[str, dict]:
+    """Build a zoom table with concrete values for a specific volume."""
+    fit_scale = max(volume_info.shape[0], volume_info.shape[1]) / VIEWPORT_SIZE
+    table = {}
+    for name, multiplier in ZOOM_LEVELS.items():
+        scale = fit_scale * multiplier
+        fov_um = scale * VIEWPORT_SIZE
+        table[name] = {
+            "crossSectionScale": scale,
+            "fov_um": fov_um,
+            "multiplier": multiplier,
+        }
+    return table
+
+
+def resolve_zoom(zoom_name: str, volume_info: "VolumeInfo") -> float:
+    """Convert a zoom level name to a crossSectionScale value."""
+    fit_scale = max(volume_info.shape[0], volume_info.shape[1]) / VIEWPORT_SIZE
+    multiplier = ZOOM_LEVELS.get(zoom_name)
+    if multiplier is not None:
+        return fit_scale * multiplier
+    # Fallback: try parsing as float
+    try:
+        return float(zoom_name)
+    except (ValueError, TypeError):
+        return fit_scale  # default to fit
+
+
+def format_zoom_table() -> str:
+    """Format the zoom options for inclusion in the prompt."""
+    return """ZOOM OPTIONS (use one of these names for "zoom"):
+  "wide" — zoomed out, all data visible
+  "full" — data fills the screen
+  "region" — a region of the data
+  "neurons" — see and count individual neurons
+  "single-cell" — zoomed in on fine cell detail"""
+
 
 @dataclass
 class VolumeInfo:
@@ -33,17 +81,20 @@ class VolumeInfo:
 
         layer_strs = [f"{l['name']} ({l['type']})" for l in self.layers]
 
+        cx = self.shape[0] / 2
+        cy = self.shape[1] / 2
+        cz = self.shape[2] / 2
+        units = "\u00b5m"
+
         lines = [
-            f"Shape: {self.shape[0]} \u00d7 {self.shape[1]} \u00d7 {self.shape[2]} voxels (x \u00d7 y \u00d7 z)",
-            f"Voxel size: {', '.join(scale_strs)}",
+            f"Size: {self.shape[0]:.0f} \u00d7 {self.shape[1]:.0f} \u00d7 {self.shape[2]:.0f} {units}",
         ]
         if self.anisotropy_ratio > 1.5:
-            lines.append(f"Anisotropy: z is {self.anisotropy_ratio:.1f}\u00d7 coarser than x/y")
+            lines.append(f"Note: z is {self.anisotropy_ratio:.1f}\u00d7 coarser than x/y")
         lines.append(f"Layers: [{', '.join(layer_strs)}]")
-        lines.append(
-            f"Viewport: {VIEWPORT_SIZE}\u00d7{VIEWPORT_SIZE} (square). "
-            f"At crossSectionScale=S, shows S\u00b7{VIEWPORT_SIZE} \u00d7 S\u00b7{VIEWPORT_SIZE} canonical voxels."
-        )
+        lines.append(f"Center: x={cx:.1f}, y={cy:.1f}, z={cz:.1f}")
+        lines.append(f"Ranges: x=[0..{self.shape[0]:.0f}], y=[0..{self.shape[1]:.0f}], z=[0..{self.shape[2]:.0f}]")
+        lines.append(f"A neuron is ~30{units} across. The scale bar in the image shows distance.")
         return "\n  ".join(lines)
 
 
@@ -100,56 +151,87 @@ def discover_volume(ng_state: dict) -> VolumeInfo:
     return info
 
 
-def read_shape_from_source(source_url: str) -> list[int] | None:
+def read_shape_from_source(source_url: str) -> list[float] | None:
     """Read volume shape from a zarr source URL.
 
-    Supports zarr:// and s3:// URLs. Returns [X, Y, Z] or None on failure.
+    Returns the physical extent [X, Y, Z] in the same coordinate units
+    that Neuroglancer uses for positions (derived from the OME-Zarr
+    multiscale transforms). This is NOT raw pixel counts.
+
+    For an OME-Zarr with shape (T,C,Z,Y,X) = (1,1,220,1920,1920)
+    and scale transform [1, 1, 1.0, 0.259, 0.259], the physical
+    extent is [1920*0.259, 1920*0.259, 220*1.0] = [497, 497, 220].
     """
-    # Strip zarr:// prefix
     url = source_url
     if url.startswith("zarr://"):
         url = url[len("zarr://"):]
-    # Remove trailing slash
     url = url.rstrip("/")
 
     try:
+        import json as _json
         import zarr
         import s3fs
 
-        # Open the zarr array at the highest resolution (level 0)
         fs = s3fs.S3FileSystem(anon=True)
         store = s3fs.S3Map(root=url, s3=fs)
         z = zarr.open(store, mode="r")
 
-        # zarr could be a group (multiscale) or array
+        # Read multiscale metadata from .zattrs
+        pixel_scales = None
+        axes_order = None
+        try:
+            attrs = _json.loads(fs.cat(url + "/.zattrs"))
+            if "multiscales" in attrs:
+                ms = attrs["multiscales"][0]
+                # Get axis names (e.g. ['t','c','z','y','x'])
+                axes_order = [a["name"] for a in ms.get("axes", [])]
+                # Get scale transform for highest-res dataset (path "0")
+                for ds in ms.get("datasets", []):
+                    if ds.get("path") == "0":
+                        for t in ds.get("coordinateTransformations", []):
+                            if t.get("type") == "scale":
+                                pixel_scales = t["scale"]
+                        break
+        except Exception:
+            pass
+
+        # Get the highest-resolution array shape
         if hasattr(z, "shape"):
-            shape = list(z.shape)
+            voxel_shape = list(z.shape)
         elif hasattr(z, "arrays"):
-            # Multiscale: get the first (highest resolution) array
-            arrays = list(z.arrays())
-            if arrays:
-                _, arr = arrays[0]
-                shape = list(arr.shape)
+            # Multiscale group: find array "0" (highest res)
+            arrays = dict(z.arrays())
+            if "0" in arrays:
+                voxel_shape = list(arrays["0"].shape)
+            elif arrays:
+                _, arr = next(iter(sorted(arrays.items())))
+                voxel_shape = list(arr.shape)
             else:
                 return None
         else:
             return None
 
-        # zarr shape is typically (T, C, Z, Y, X) or (Z, Y, X) or (C, Z, Y, X)
-        # We need to figure out which axes are spatial
-        # For NG zarr sources, shape is often just the spatial dims
-        if len(shape) == 3:
-            # Assume Z, Y, X order (common for zarr) → return as X, Y, Z
-            return [shape[2], shape[1], shape[0]]
-        elif len(shape) == 4:
-            # Could be (C, Z, Y, X) or (T, Z, Y, X)
-            return [shape[3], shape[2], shape[1]]
-        elif len(shape) == 5:
-            # (T, C, Z, Y, X)
-            return [shape[4], shape[3], shape[2]]
-        else:
-            # Just take the last 3 dims
-            return [shape[-1], shape[-2], shape[-3]]
+        # Map to spatial (X, Y, Z) in physical units
+        if axes_order and pixel_scales and len(axes_order) == len(voxel_shape):
+            # Use axis names to find x, y, z indices
+            physical = {}
+            for i, axis_name in enumerate(axes_order):
+                if axis_name in ("x", "y", "z"):
+                    physical[axis_name] = voxel_shape[i] * pixel_scales[i]
+            if "x" in physical and "y" in physical and "z" in physical:
+                result = [physical["x"], physical["y"], physical["z"]]
+                print(f"  Zarr physical extent: {result[0]:.1f} × {result[1]:.1f} × {result[2]:.1f} "
+                      f"(from {voxel_shape} voxels × {pixel_scales} scale)")
+                return result
+
+        # Fallback: no multiscale metadata, return raw voxel counts
+        # Assume last 3 dims are Z, Y, X
+        if len(voxel_shape) >= 3:
+            shape_xyz = [voxel_shape[-1], voxel_shape[-2], voxel_shape[-3]]
+            print(f"  Zarr voxel shape (no multiscale metadata): {shape_xyz}")
+            return shape_xyz
+
+        return None
 
     except Exception as e:
         print(f"  WARNING: Failed to read shape from {url}: {e}")

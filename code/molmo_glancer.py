@@ -22,10 +22,11 @@ from gpu_config import load_model, get_vram_usage
 from volume_info import (
     VolumeInfo, discover_volume, compute_fov,
     compute_visible_window, format_fov_feedback,
+    resolve_zoom,
 )
 from visual_capture import (
     build_clean_state, capture_screenshot, execute_scan,
-    create_browser,
+    create_browser, VIEWPORT_SIZE,
 )
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -152,29 +153,35 @@ def parse_action(model_output: str) -> dict | None:
 
 
 def validate_action(action: dict, volume_info: VolumeInfo) -> dict:
-    """Validate and normalize an action dict. Clamps positions, validates scales."""
+    """Validate and normalize an action dict. Resolves zoom names, clamps positions."""
     action_type = action.get("action", "")
 
     if action_type in ("screenshot", "scan"):
+        # ── Resolve zoom name to crossSectionScale ──────────────────
+        # The model sends "zoom": "fit" etc., we translate to a float.
+        # Check both the action top-level (scans) and view dict (screenshots).
+        for container in [action, action.get("view", {})]:
+            if "zoom" in container:
+                container["crossSectionScale"] = resolve_zoom(
+                    container.pop("zoom"), volume_info
+                )
+
         view = action.get("view", {})
         if action_type == "scan":
-            # For scans, validate start/end
             for key in ("start", "end"):
                 pos = action.get(key, {})
                 for i, axis in enumerate(["x", "y", "z"]):
                     if axis in pos:
-                        pos[axis] = max(0, min(float(pos[axis]), volume_info.shape[i] - 1))
+                        pos[axis] = max(0, min(float(pos[axis]), volume_info.shape[i]))
         else:
-            # For screenshots, validate view position
             for i, axis in enumerate(["x", "y", "z"]):
                 if axis in view:
-                    view[axis] = max(0, min(float(view[axis]), volume_info.shape[i] - 1))
+                    view[axis] = max(0, min(float(view[axis]), volume_info.shape[i]))
 
-            # Validate scale
             if "crossSectionScale" in view:
                 scale = float(view["crossSectionScale"])
                 if scale <= 0:
-                    view["crossSectionScale"] = 1.0
+                    view["crossSectionScale"] = resolve_zoom("fit", volume_info)
                 else:
                     view["crossSectionScale"] = scale
 
@@ -183,42 +190,38 @@ def validate_action(action: dict, volume_info: VolumeInfo) -> dict:
 
 # ── Duplicate Detection ─────────────────────────────────────────────────────
 
-def is_duplicate_view(new_action: dict, history: list[dict], volume_info: VolumeInfo, threshold: float = 0.8) -> bool:
-    """Check if a new screenshot/scan overlaps >threshold with a prior view."""
-    if new_action.get("action") not in ("screenshot",):
+def _action_fingerprint(action: dict) -> str:
+    """Create a fingerprint string for an action to detect near-duplicates."""
+    atype = action.get("action", "")
+    if atype == "screenshot":
+        v = action.get("view", {})
+        # Round positions to nearest 5 units, scale to 2 decimal places
+        return (f"screenshot|{v.get('layout','xy')}|"
+                f"{round(v.get('x',0)/5)*5},{round(v.get('y',0)/5)*5},{round(v.get('z',0)/5)*5}|"
+                f"{round(v.get('crossSectionScale',1.0), 2)}")
+    elif atype == "scan":
+        s = action.get("start", {})
+        e = action.get("end", {})
+        return (f"scan|{action.get('scan_type','')}|{action.get('layout','xy')}|"
+                f"{round(s.get('x',0)/5)*5},{round(s.get('y',0)/5)*5},{round(s.get('z',0)/5)*5}|"
+                f"{round(e.get('x',0)/5)*5},{round(e.get('y',0)/5)*5},{round(e.get('z',0)/5)*5}|"
+                f"{round(action.get('crossSectionScale',1.0), 2)}")
+    return ""
+
+
+def is_duplicate_action(new_action: dict, history: list[dict]) -> bool:
+    """Check if this action has already been performed (screenshot or scan)."""
+    atype = new_action.get("action", "")
+    if atype not in ("screenshot", "scan"):
         return False
 
-    new_view = new_action.get("view", {})
-    new_layout = new_view.get("layout", "xy")
-    new_scale = new_view.get("crossSectionScale", 1.0)
-    new_pos = [new_view.get("x", 0), new_view.get("y", 0), new_view.get("z", 0)]
-
-    new_window = compute_visible_window(new_pos, new_scale, volume_info.canonical_factors)
+    new_fp = _action_fingerprint(new_action)
+    if not new_fp:
+        return False
 
     for entry in history:
         prev = entry.get("action_data", {})
-        if prev.get("action") != "screenshot":
-            continue
-        prev_view = prev.get("view", {})
-        if prev_view.get("layout", "xy") != new_layout:
-            continue
-
-        prev_scale = prev_view.get("crossSectionScale", 1.0)
-        # Skip if scales differ by more than 2x
-        if max(new_scale, prev_scale) / max(min(new_scale, prev_scale), 0.001) > 2.0:
-            continue
-
-        prev_pos = [prev_view.get("x", 0), prev_view.get("y", 0), prev_view.get("z", 0)]
-        prev_window = compute_visible_window(prev_pos, prev_scale, volume_info.canonical_factors)
-
-        # Compute overlap fraction
-        overlap = 1.0
-        for (new_lo, new_hi), (prev_lo, prev_hi) in zip(new_window, prev_window):
-            extent = max(new_hi - new_lo, 0.001)
-            inter = max(0, min(new_hi, prev_hi) - max(new_lo, prev_lo))
-            overlap *= inter / extent
-
-        if overlap > threshold:
+        if _action_fingerprint(prev) == new_fp:
             return True
 
     return False
@@ -226,33 +229,42 @@ def is_duplicate_view(new_action: dict, history: list[dict], volume_info: Volume
 
 # ── Prompt Construction ─────────────────────────────────────────────────────
 
-ACTION_SCHEMA = """ACTIONS AVAILABLE:
+def build_action_schema(volume_info: VolumeInfo) -> str:
+    """Build the action schema with volume-appropriate example coordinates."""
+    from volume_info import format_zoom_table
+    cx = volume_info.shape[0] / 2
+    cy = volume_info.shape[1] / 2
+    cz = volume_info.shape[2] / 2
+    zmax = volume_info.shape[2]
+
+    return f"""ACTIONS AVAILABLE:
 You must respond with exactly one JSON object. Available actions:
 
-1. screenshot — Take a single high-detail view
-   {"action": "screenshot",
-    "view": {"x": 25000, "y": 12000, "z": 500, "layout": "xy",
-             "crossSectionScale": 0.5},
-    "prompt": "What do you see in this zoomed-in XY view?"}
+1. screenshot — capture a view of the data
+   {{"action": "screenshot",
+    "view": {{"x": {cx:.0f}, "y": {cy:.0f}, "z": {cz:.0f}, "layout": "xy",
+             "zoom": "neurons"}},
+    "prompt": "Count the neurons visible in this view."}}
 
-2. scan — Sweep through data as video (for survey/orientation)
-   {"action": "scan", "scan_type": "z_sweep",
-    "start": {"x": 25000, "y": 12000, "z": 0},
-    "end":   {"x": 25000, "y": 12000, "z": 2000},
-    "frames": 20, "layout": "xy", "crossSectionScale": 5.0,
-    "prompt": "Watch this Z-sweep and identify regions of interest."}
-   scan_type options: z_sweep, x_pan, y_pan, zoom_ramp
+2. scan — sweep through data as video
+   {{"action": "scan", "scan_type": "z_sweep",
+    "start": {{"x": {cx:.0f}, "y": {cy:.0f}, "z": 0}},
+    "end":   {{"x": {cx:.0f}, "y": {cy:.0f}, "z": {zmax:.0f}}},
+    "frames": 20, "layout": "xy", "zoom": "full",
+    "prompt": "Survey the full depth and describe what you see."}}
+   scan_type options: z_sweep, x_pan, y_pan
 
-3. think — Reason about findings so far (no visual input, no cost)
-   {"action": "think",
-    "reasoning": "I've surveyed the full Z range and found..."}
+3. think — reason about findings (no visual input)
+   {{"action": "think",
+    "reasoning": "I've surveyed the full Z range and found..."}}
 
-4. answer — Provide your final answer (terminates the session)
-   {"action": "answer",
-    "answer": "Based on my analysis of N views..."}
+4. answer — final answer (ends the session)
+   {{"action": "answer",
+    "answer": "Based on my analysis..."}}
 
-LAYOUT OPTIONS: "xy" (axial), "xz" (coronal), "yz" (sagittal), "3d", "4panel"
-crossSectionScale: <1 = zoom in (fewer voxels, more detail), >1 = zoom out (more voxels, less detail)
+LAYOUT: "xy", "xz", "yz", "3d", "4panel"
+
+{format_zoom_table()}
 """
 
 
@@ -275,7 +287,7 @@ def build_decision_prompt(question: str, volume_info: VolumeInfo,
             "Respond with: {\"action\": \"answer\", \"answer\": \"your answer here\"}\n"
         )
     else:
-        parts.append(ACTION_SCHEMA)
+        parts.append(build_action_schema(volume_info))
 
     # Volume info
     parts.append(f"\nVOLUME INFO:\n  {volume_info.format_for_prompt()}\n")
@@ -385,6 +397,39 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
     with sync_playwright() as pw:
         browser, page = create_browser(pw)
 
+        # ── First look: screenshot the user's original NG link ──────────
+        print("[First Look] Screenshotting the user's original NG view ...")
+        screenshot_count += 1
+        cx, cy, cz = volume_info.shape[0] / 2, volume_info.shape[1] / 2, volume_info.shape[2] / 2
+        first_look_state = build_clean_state(base_state, {
+            "x": cx, "y": cy, "z": cz,
+        }, volume_info)
+        first_look_img = capture_screenshot(page, first_look_state, config, screenshot_count)
+
+        first_look_prompt = (
+            f"This is the user's original Neuroglancer view of a 3D microscopy volume.\n"
+            f"Volume: {volume_info.shape[0]}×{volume_info.shape[1]}×{volume_info.shape[2]} voxels.\n"
+            f"Question they want answered: \"{question}\"\n\n"
+            f"Describe what you see: what kind of data is this? What structures, "
+            f"brightness patterns, or features are visible? How dense or sparse is the content? "
+            f"This will help you plan how to explore the volume."
+        )
+        first_look_finding, tokens = ask_vision(
+            model, processor, first_look_img, first_look_prompt,
+            max_new_tokens=512, config=config,
+        )
+        track(0, "first_look", tokens)
+        print(f"  First look finding: {first_look_finding[:300]}...")
+
+        history.append({
+            "iteration": 0,
+            "action_data": {"action": "screenshot", "view": {"layout": base_state.data.get("layout", "4panel")},
+                            "prompt": "Initial view (user's original NG link)"},
+            "finding": first_look_finding,
+            "fov_feedback": "[user's original view — default zoom and position]",
+        })
+
+        # ── Agent loop ──────────────────────────────────────────────────
         for iteration in range(1, max_iter + 1):
             print(f"\n{'='*60}")
             print(f"  Iteration {iteration}/{max_iter}")
@@ -426,47 +471,62 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
             action_type = action.get("action", "unknown")
             print(f"\n  [Action] {action_type}")
 
+            # ── Duplicate check (screenshots AND scans) ────────────────
+            if is_duplicate_action(action, history):
+                print("  SKIPPED: duplicate action (same parameters as a prior action)")
+                history.append({
+                    "iteration": iteration,
+                    "action_data": action,
+                    "finding": "[skipped — duplicate action, try different parameters]",
+                    "fov_feedback": "",
+                })
+                continue
+
             # ── Execute action ──────────────────────────────────────────
             finding = ""
             fov_feedback = ""
 
             if action_type == "screenshot":
                 view_spec = action.get("view", {})
-                interpret_prompt = action.get("prompt", "Describe what you see in this view.")
+                user_prompt = action.get("prompt", "Describe what you see in this view.")
+                screenshot_count += 1
+                state = build_clean_state(base_state, view_spec, volume_info)
+                img = capture_screenshot(page, state, config, screenshot_count)
 
-                # Check for duplicate
-                if is_duplicate_view(action, history, volume_info):
-                    print("  SKIPPED: duplicate view (>80% overlap with prior view)")
-                    finding = "[skipped — duplicate view]"
-                else:
-                    screenshot_count += 1
-                    state = build_clean_state(base_state, view_spec, volume_info)
-                    img = capture_screenshot(page, state, config, screenshot_count)
+                interpret_prompt = (
+                    f"{user_prompt}\n"
+                    f"A neuron is ~30\u00b5m across. Use the scale bar for reference."
+                )
 
-                    # Model interprets the screenshot
-                    print(f"  [Interpret] {interpret_prompt[:80]}...")
-                    finding, tokens = ask_vision(
-                        model, processor, img, interpret_prompt,
-                        max_new_tokens=1024, config=config,
-                    )
-                    track(iteration, "interpret", tokens)
-                    print(f"  Finding: {finding[:200]}...")
+                # Model interprets the screenshot
+                print(f"  [Interpret] {user_prompt[:80]}...")
+                finding, tokens = ask_vision(
+                    model, processor, img, interpret_prompt,
+                    max_new_tokens=1024, config=config,
+                )
+                track(iteration, "interpret", tokens)
+                print(f"  Finding: {finding[:200]}...")
 
-                    # FOV feedback
-                    pos = [view_spec.get("x", 0), view_spec.get("y", 0), view_spec.get("z", 0)]
-                    scale = view_spec.get("crossSectionScale", 1.0)
-                    layout = view_spec.get("layout", "xy")
-                    fov_feedback = format_fov_feedback(pos, scale, layout, volume_info)
-                    print(f"  {fov_feedback}")
+                # FOV feedback
+                pos = [view_spec.get("x", 0), view_spec.get("y", 0), view_spec.get("z", 0)]
+                scale = view_spec.get("crossSectionScale", 1.0)
+                layout = view_spec.get("layout", "xy")
+                fov_feedback = format_fov_feedback(pos, scale, layout, volume_info)
+                print(f"  {fov_feedback}")
 
             elif action_type == "scan":
                 scan_count += 1
-                interpret_prompt = action.get("prompt", "Describe what you observe in this scan.")
+                user_prompt = action.get("prompt", "Describe what you observe in this scan.")
 
                 frames = execute_scan(page, base_state, action, volume_info, config, scan_count)
 
+                interpret_prompt = (
+                    f"{user_prompt}\n"
+                    f"A neuron is ~30\u00b5m across. Use the scale bar for reference."
+                )
+
                 # Model interprets the scan frames
-                print(f"  [Interpret scan] {len(frames)} frames, {interpret_prompt[:80]}...")
+                print(f"  [Interpret scan] {len(frames)} frames, {user_prompt[:80]}...")
                 finding, tokens = ask_scan(
                     model, processor, frames, interpret_prompt,
                     max_new_tokens=1024, config=config,
