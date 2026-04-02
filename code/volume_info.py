@@ -61,94 +61,160 @@ def format_zoom_table() -> str:
 
 
 @dataclass
+class LayerInfo:
+    """Metadata about a single NG layer."""
+    name: str
+    type: str                           # "image", "segmentation", "annotation"
+    source: str                         # zarr source URL
+    extent: list[float] | None         # [X, Y, Z] physical extent, or None if unknown
+    visible: bool
+    shader_range: list[float] | None   # [vmin, vmax] if available
+
+
+@dataclass
 class VolumeInfo:
     """Metadata about the volume being analyzed."""
-    shape: list[int]                    # [X, Y, Z] voxel counts
+    bounding_box: list[float]           # [X, Y, Z] extent of visible layers
     voxel_scales: list[float]           # [sx, sy, sz] in meters
     axis_names: list[str]               # ["x", "y", "z"] or ["x", "y", "z", "t"]
-    layers: list[dict]                  # [{"name": ..., "type": ...}, ...]
+    layers: list[LayerInfo]             # per-layer metadata
     canonical_factors: list[float]      # [fx, fy, fz] — scale / min(scale)
     anisotropy_ratio: float             # max(factors) / min(factors)
 
+    @property
+    def shape(self) -> list[float]:
+        """Extent based on visible layers (backward compatible)."""
+        visible = [l for l in self.layers if l.visible and l.extent]
+        if visible:
+            return [
+                max(l.extent[i] for l in visible)
+                for i in range(3)
+            ]
+        return self.bounding_box
+
     def format_for_prompt(self) -> str:
         """Format volume info for inclusion in the agent decision prompt."""
-        # Convert voxel scales to human-readable units
-        scale_strs = []
-        for s, name in zip(self.voxel_scales[:3], self.axis_names[:3]):
-            if s >= 1e-6:
-                scale_strs.append(f"{name}={s*1e6:.1f}\u00b5m")
-            else:
-                scale_strs.append(f"{name}={s*1e9:.1f}nm")
-
-        layer_strs = [f"{l['name']} ({l['type']})" for l in self.layers]
-
-        cx = self.shape[0] / 2
-        cy = self.shape[1] / 2
-        cz = self.shape[2] / 2
+        s = self.shape
+        cx, cy, cz = s[0] / 2, s[1] / 2, s[2] / 2
         units = "\u00b5m"
 
         lines = [
-            f"Size: {self.shape[0]:.0f} \u00d7 {self.shape[1]:.0f} \u00d7 {self.shape[2]:.0f} {units}",
+            f"Size: {s[0]:.0f} \u00d7 {s[1]:.0f} \u00d7 {s[2]:.0f} {units} (visible layers)",
         ]
         if self.anisotropy_ratio > 1.5:
             lines.append(f"Note: z is {self.anisotropy_ratio:.1f}\u00d7 coarser than x/y")
-        lines.append(f"Layers: [{', '.join(layer_strs)}]")
+
+        # Per-layer listing
+        lines.append("Layers:")
+        for l in self.layers:
+            vis = "visible" if l.visible else "hidden"
+            if l.extent:
+                ext = f"{l.extent[0]:.0f}\u00d7{l.extent[1]:.0f}\u00d7{l.extent[2]:.0f} {units}"
+            else:
+                ext = "extent unknown"
+            lines.append(f"  - {l.name} ({l.type}, {ext}) [{vis}]")
+
         lines.append(f"Center: x={cx:.1f}, y={cy:.1f}, z={cz:.1f}")
-        lines.append(f"Ranges: x=[0..{self.shape[0]:.0f}], y=[0..{self.shape[1]:.0f}], z=[0..{self.shape[2]:.0f}]")
-        lines.append(f"A neuron is ~30{units} across. The scale bar in the image shows distance.")
+        lines.append(f"Ranges: x=[0..{s[0]:.0f}], y=[0..{s[1]:.0f}], z=[0..{s[2]:.0f}]")
+
+        # Pixel size context at full zoom
+        um_per_pixel = max(s[0], s[1]) / VIEWPORT_SIZE
+        neuron_um = 30.0
+        neuron_pixels = neuron_um / um_per_pixel
+        lines.append(
+            f"A neuron is ~{neuron_um:.0f}{units} across "
+            f"(~{neuron_pixels:.0f}px at full zoom). "
+            f"{'Objects this small need zoomed-in views for reliable detection.' if neuron_pixels < 40 else 'Visible at full zoom.'}"
+        )
         return "\n  ".join(lines)
+
+
+def _get_layer_source(layer: dict) -> str:
+    """Extract the source URL string from an NG layer dict."""
+    source = layer.get("source", "")
+    if isinstance(source, dict):
+        return source.get("url", "")
+    return source
+
+
+def _get_layer_visibility(layer: dict) -> bool:
+    """Check if a layer is visible (default True if not specified)."""
+    # NG uses "visible" key; absent means visible
+    return layer.get("visible", True)
+
+
+def _get_shader_range(layer: dict) -> list[float] | None:
+    """Extract shader range from a layer's shaderControls if present."""
+    sc = layer.get("shaderControls", {})
+    normalized = sc.get("normalized", {})
+    r = normalized.get("range")
+    if isinstance(r, list) and len(r) == 2:
+        return [float(r[0]), float(r[1])]
+    return None
 
 
 def discover_volume(ng_state: dict) -> VolumeInfo:
     """Extract volume metadata from an NG state dict.
 
-    Reads dimensions and layer info from the state. Attempts to read
-    shape from zarr source if available, otherwise uses a fallback.
+    Reads dimensions and per-layer info. Attempts to read shape from each
+    layer's zarr source. Computes bounding box from all layers.
     """
     dims = ng_state.get("dimensions", {})
     axis_names = list(dims.keys())
     voxel_scales = [v[0] for v in dims.values()]
 
+    # ── Discover per-layer metadata ────────────────────────────────────
     layers = []
     for layer in ng_state.get("layers", []):
-        layers.append({
-            "name": layer.get("name", "unknown"),
-            "type": layer.get("type", "image"),
-        })
+        source = _get_layer_source(layer)
+        visible = _get_layer_visibility(layer)
+        shader_range = _get_shader_range(layer)
 
-    # Try to read shape from the first image layer's zarr source
-    shape = None
-    for layer in ng_state.get("layers", []):
-        source = layer.get("source", "")
+        extent = None
         if isinstance(source, str) and "zarr" in source:
-            shape = read_shape_from_source(source)
-            if shape is not None:
-                break
+            extent = read_shape_from_source(source)
 
-    if shape is None:
-        # Fallback: try to infer from position bounds or use a default
-        print("  WARNING: Could not read shape from zarr source. Using position-based estimate.")
+        layers.append(LayerInfo(
+            name=layer.get("name", "unknown"),
+            type=layer.get("type", "image"),
+            source=source,
+            extent=extent,
+            visible=visible,
+            shader_range=shader_range,
+        ))
+
+    # ── Compute bounding box (union of all layers with known extent) ──
+    layers_with_extent = [l for l in layers if l.extent]
+    if layers_with_extent:
+        bounding_box = [
+            max(l.extent[i] for l in layers_with_extent)
+            for i in range(3)
+        ]
+    else:
+        # Fallback: infer from position
+        print("  WARNING: No layer shapes discovered. Using position-based estimate.")
         pos = ng_state.get("position", [0, 0, 0])
-        # Use 2x position as rough estimate if position looks like center
-        shape = [max(int(p * 2), 1000) for p in pos[:3]]
+        bounding_box = [max(int(p * 2), 1000) for p in pos[:3]]
 
-    # Compute canonical factors (for FOV computation)
+    # ── Compute canonical factors (for FOV computation) ────────────────
     spatial_scales = voxel_scales[:3] if len(voxel_scales) >= 3 else voxel_scales
     canonical = min(spatial_scales) if spatial_scales else 1.0
     factors = [s / canonical for s in spatial_scales]
     anisotropy = max(factors) / min(factors) if factors else 1.0
 
     info = VolumeInfo(
-        shape=shape[:3],
+        bounding_box=bounding_box,
         voxel_scales=voxel_scales[:3],
         axis_names=axis_names,
         layers=layers,
         canonical_factors=factors,
         anisotropy_ratio=anisotropy,
     )
-    print(f"  Volume: {info.shape[0]}\u00d7{info.shape[1]}\u00d7{info.shape[2]}, "
+
+    visible_count = sum(1 for l in layers if l.visible)
+    print(f"  Volume: {info.shape[0]:.0f}\u00d7{info.shape[1]:.0f}\u00d7{info.shape[2]:.0f}, "
           f"anisotropy={info.anisotropy_ratio:.1f}x, "
-          f"{len(info.layers)} layers")
+          f"{len(info.layers)} layers ({visible_count} visible)")
     return info
 
 

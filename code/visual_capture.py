@@ -128,6 +128,7 @@ def build_clean_state(base_state, view_spec: dict, volume_info=None):
         crossSectionOrientation   — oblique slice quaternion
         layerVisibility           — {"layer_name": bool, ...}
         shaderRange               — [vmin, vmax] for image layers
+        layerColors               — {"layer_name": "#RRGGBB", ...}
     """
     state = base_state.clone()
     d = state.data
@@ -193,6 +194,15 @@ def build_clean_state(base_state, view_spec: dict, volume_info=None):
             if layer.get("type") == "image":
                 sc = layer.setdefault("shaderControls", {})
                 sc.setdefault("normalized", {})["range"] = [vmin, vmax]
+
+    # ── Layer colors ───────────────────────────────────────────────────
+    if "layerColors" in view_spec:
+        for layer in d.get("layers", []):
+            name = layer.get("name", "")
+            if name in view_spec["layerColors"]:
+                color = view_spec["layerColors"][name]
+                sc = layer.setdefault("shaderControls", {})
+                sc["color"] = color
 
     return state
 
@@ -433,8 +443,8 @@ def save_scan_video(frames: list[Image.Image], scan_id: int,
 
 # ── Point Annotation ────────────────────────────────────────────────────────
 
-MARKER_RADIUS = 8
-MARKER_COLOR = (0, 255, 0)       # green fill
+MARKER_RADIUS = 16
+MARKER_COLOR = (255, 0, 0)       # red fill
 MARKER_OUTLINE = (255, 255, 255)  # white border
 
 

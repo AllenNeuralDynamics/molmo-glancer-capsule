@@ -1,7 +1,7 @@
 """
 molmo-glancer v3 — Autonomous Neuroglancer Visual Analysis
 ==========================================================
-Agent loop: model decides actions (screenshot, scan, think, answer),
+Agent loop: model decides actions (screenshot, scan, count, reason, answer),
 system executes them (Playwright + NeuroglancerState), model interprets.
 Iterates until confident or max iterations reached.
 
@@ -29,7 +29,7 @@ from volume_info import (
 )
 from visual_capture import (
     build_clean_state, capture_screenshot, execute_scan,
-    create_browser, VIEWPORT_SIZE,
+    create_browser, VIEWPORT_SIZE, save_scan_video,
     annotate_screenshot, annotate_scan_frames,
 )
 
@@ -37,7 +37,38 @@ from visual_capture import (
 
 RESULTS_DIR = Path("/results")
 
-# Inputs — override via env vars or edit defaults here
+# Named presets: --preset <name> selects an NG link + question pair
+PRESETS = {
+    "neurons": {
+        "ng_link": "/root/capsule/code/ng_links/example_ng_link.txt",
+        "question": "How many neurons can you count in this volume?",
+    },
+    "alignment": {
+        "ng_link": "/root/capsule/code/ng_links/example_r2r_ng_link.txt",
+        "question": (
+            "How well are the neurons aligned between the fixed (green) and moving (magenta) volumes? "
+            "Use layerVisibility to compare: show each layer alone, then overlay both. "
+            "Look for overlap, shifts, and misregistration between the two."
+        ),
+    },
+    "neurons_large": {
+        "ng_link": "/root/capsule/code/ng_links/large_ng_link.txt",
+        "question": "How many neurons can you count in this volume?",
+    },
+    "alignment_loop": {
+        "ng_link": "/root/capsule/code/ng_links/alignment_loop.txt",
+        "question": (
+            "How does neuron alignment change across the iterative alignment loops? "
+            "The fixed volume is green, the moving volume is magenta, and the moving "
+            "segmentation layers are white/black. Some layers are initially disabled — "
+            "the initial view shows the fixed reference and the final aligned moving volume. "
+            "Use layerVisibility to enable other loop layers and compare alignment quality "
+            "across iterations, including the Raw (unwarped) moving round."
+        ),
+    },
+}
+
+# Defaults — overridden by --preset or env vars
 NG_LINK_FILE = os.environ.get("NG_LINK_FILE",
     "/root/capsule/code/ng_links/example_ng_link.txt")
 QUESTION = os.environ.get("QUESTION",
@@ -255,8 +286,15 @@ def parse_action(model_output: str) -> dict | None:
 
     Returns parsed dict or None if no valid JSON found.
     """
-    # Try to find JSON object in the output
-    # First try: look for ```json ... ``` blocks
+    # First try: the entire output might be JSON (handles nested braces correctly)
+    try:
+        result = json.loads(model_output.strip())
+        if isinstance(result, dict) and "action" in result:
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # Second try: look for ```json ... ``` blocks
     json_block = re.search(r'```json\s*(\{.*?\})\s*```', model_output, re.DOTALL)
     if json_block:
         try:
@@ -264,18 +302,20 @@ def parse_action(model_output: str) -> dict | None:
         except json.JSONDecodeError:
             pass
 
-    # Second try: find the outermost { ... }
-    brace_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', model_output, re.DOTALL)
-    if brace_match:
-        try:
-            return json.loads(brace_match.group())
-        except json.JSONDecodeError:
-            pass
-
-    # Third try: the entire output might be JSON
-    try:
-        return json.loads(model_output.strip())
-    except json.JSONDecodeError:
+    # Third try: find the outermost { ... } by matching balanced braces
+    start = model_output.find('{')
+    if start >= 0:
+        depth = 0
+        for i in range(start, len(model_output)):
+            if model_output[i] == '{':
+                depth += 1
+            elif model_output[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(model_output[start:i+1])
+                    except json.JSONDecodeError:
+                        break
         pass
 
     return None
@@ -320,48 +360,66 @@ def validate_action(action: dict, volume_info: VolumeInfo) -> dict:
     return action
 
 
-# ── Duplicate Detection ─────────────────────────────────────────────────────
+# ── Duplicate Detection & Frame Cache ──────────────────────────────────────
+
+def _geometry_fingerprint(action: dict) -> str:
+    """Geometric-only fingerprint for frame caching (ignores prompt/target)."""
+    atype = action.get("action", "")
+    if atype in ("scan", "count"):
+        s = action.get("start", {})
+        e = action.get("end", {})
+        return (f"{action.get('scan_type','')}|{action.get('layout','xy')}|"
+                f"{round(s.get('x',0)/5)*5},{round(s.get('y',0)/5)*5},{round(s.get('z',0)/5)*5}|"
+                f"{round(e.get('x',0)/5)*5},{round(e.get('y',0)/5)*5},{round(e.get('z',0)/5)*5}|"
+                f"{round(action.get('crossSectionScale',1.0), 2)}|"
+                f"{action.get('frames', 50)}")
+    return ""
+
 
 def _action_fingerprint(action: dict) -> str:
     """Create a fingerprint string for an action to detect near-duplicates.
 
-    Includes geometry AND intent (prompt/target) so the same region can be
-    revisited with a different analytical goal.
+    Uses geometry + action type + target (for count). Does NOT include free-form
+    prompt text — rephrased prompts on the same view are duplicates.
+    A scan and count of the same region are distinct (different atype).
     """
     atype = action.get("action", "")
-    intent = action.get("prompt", action.get("target", ""))
+    # For screenshots, include layerVisibility so toggling layers = different view
+    layer_vis = ""
     if atype == "screenshot":
         v = action.get("view", {})
-        # Round positions to nearest 5 units, scale to 2 decimal places
+        lv = v.get("layerVisibility", action.get("layerVisibility", {}))
+        if lv:
+            layer_vis = "|" + ",".join(f"{k}={v}" for k, v in sorted(lv.items()))
         return (f"screenshot|{v.get('layout','xy')}|"
                 f"{round(v.get('x',0)/5)*5},{round(v.get('y',0)/5)*5},{round(v.get('z',0)/5)*5}|"
-                f"{round(v.get('crossSectionScale',1.0), 2)}|{intent}")
+                f"{round(v.get('crossSectionScale',1.0), 2)}{layer_vis}")
     elif atype in ("scan", "count"):
         s = action.get("start", {})
         e = action.get("end", {})
+        target = action.get("target", "") if atype == "count" else ""
+        lv = action.get("layerVisibility", {})
+        if lv:
+            layer_vis = "|" + ",".join(f"{k}={v}" for k, v in sorted(lv.items()))
         return (f"{atype}|{action.get('scan_type','')}|{action.get('layout','xy')}|"
                 f"{round(s.get('x',0)/5)*5},{round(s.get('y',0)/5)*5},{round(s.get('z',0)/5)*5}|"
                 f"{round(e.get('x',0)/5)*5},{round(e.get('y',0)/5)*5},{round(e.get('z',0)/5)*5}|"
-                f"{round(action.get('crossSectionScale',1.0), 2)}|{intent}")
+                f"{round(action.get('crossSectionScale',1.0), 2)}|{target}{layer_vis}")
     return ""
 
 
-def is_duplicate_action(new_action: dict, history: list[dict]) -> bool:
-    """Check if this action has already been performed (screenshot or scan)."""
+def count_prior_matches(new_action: dict, history: list[dict]) -> int:
+    """Count how many times this action fingerprint appears in history."""
     atype = new_action.get("action", "")
     if atype not in ("screenshot", "scan", "count"):
-        return False
+        return 0
 
     new_fp = _action_fingerprint(new_action)
     if not new_fp:
-        return False
+        return 0
 
-    for entry in history:
-        prev = entry.get("action_data", {})
-        if _action_fingerprint(prev) == new_fp:
-            return True
-
-    return False
+    return sum(1 for entry in history
+               if _action_fingerprint(entry.get("action_data", {})) == new_fp)
 
 
 # ── Prompt Construction ─────────────────────────────────────────────────────
@@ -383,29 +441,33 @@ You must respond with exactly one JSON object. Available actions:
              "zoom": "full"}},
     "prompt": "<what specifically to look for in this view>"}}
 
-2. scan — sweep through the data as a video, then describe what you see
+2. scan — sweep through the data as a video and DESCRIBE what you see (qualitative)
    {{"action": "scan", "scan_type": "z_sweep",
     "start": {{"x": {cx:.0f}, "y": {cy:.0f}, "z": 0}},
     "end":   {{"x": {cx:.0f}, "y": {cy:.0f}, "z": {zmax:.0f}}},
     "frames": {max_scan_frames}, "layout": "xy", "zoom": "full",
     "prompt": "<what specifically to look for across this sweep>"}}
    scan_type options: z_sweep, x_pan, y_pan
+   scan is for QUALITATIVE description — understanding structure, distribution, and context.
+   Do NOT use scan to produce numerical counts; use count for that.
 
-3. count — sweep through the data and POINT TO specific objects in sampled keyframes to count them
+3. count — DETECT + COUNT specific objects via automated pointing on sampled keyframes
    {{"action": "count", "scan_type": "z_sweep",
     "start": {{"x": {cx:.0f}, "y": {cy:.0f}, "z": 0}},
     "end":   {{"x": {cx:.0f}, "y": {cy:.0f}, "z": {zmax:.0f}}},
     "frames": {max_scan_frames}, "layout": "xy", "zoom": "full",
     "target": "neurons", "keyframe_interval": 5}}
-   Use count when you need to locate and count specific objects.
-   The system captures a scan, then runs pointing on keyframes sampled every
-   keyframe_interval frames. Choose the interval based on object size vs frame spacing:
-   small/dense objects need tighter sampling (2-3), large/sparse objects can use wider (5-10).
+   The system automatically detects and marks each instance in sampled keyframes —
+   you get back exact per-frame counts. Use count when you need quantitative results.
+   A scan first can help you decide what to count, where, and at what zoom.
+   keyframe_interval: spacing between sampled frames (2-3 for small/dense, 5-10 for large/sparse).
    "target" should be a short noun describing what to count.
 
-4. think — reason about findings so far (no visual input)
-   {{"action": "think",
-    "reasoning": "<your reasoning here>"}}
+4. reason — reason about findings so far (no visual input, runs a text inference call)
+   {{"action": "reason",
+    "question": "<what you want to reason about>"}}
+   Use reason to synthesize findings, resolve contradictions, or plan next steps
+   before committing to a visual action or final answer.
 
 5. answer — final answer (ends the session)
    {{"action": "answer",
@@ -413,6 +475,11 @@ You must respond with exactly one JSON object. Available actions:
 
 LAYOUT: "xy", "xz", "yz", "4panel"
 NOTE: Do NOT use "3d" layout — it renders only a wireframe bounding box for raw image data, not the actual voxel data.
+
+OPTIONAL VIEW KEYS (for screenshot, scan, and count):
+  "layerVisibility": {{"layer name": true, "other layer": false}}  — toggle layers on/off
+  "shaderRange": [vmin, vmax]  — adjust brightness/contrast for image layers
+  "layerColors": {{"layer name": "#FF0000"}}  — set layer color (hex RGB)
 
 IMPORTANT: Zooms below "full" CROP the view — you will miss data outside the visible area.
 
@@ -468,9 +535,9 @@ def build_decision_prompt(question: str, volume_info: VolumeInfo,
                     )
                 elif atype in ("scan", "count"):
                     summary_lines.append(f"  [{atype}, {a.get('scan_type','?')}, {a.get('frames',0)} frames]")
-                elif atype == "think":
-                    reasoning = a.get("reasoning", "")[:100]
-                    summary_lines.append(f"  [think: {reasoning}...]")
+                elif atype == "reason":
+                    reasoning = a.get("reasoning", a.get("question", ""))[:100]
+                    summary_lines.append(f"  [{atype}: {reasoning}...]")
             parts.append("\n".join(summary_lines))
 
             parts.append(f"\nRECENT FINDINGS (iterations {len(older)+1}-{len(history)}):")
@@ -504,8 +571,8 @@ def format_history_entry(entry: dict) -> str:
         header = (f"  [action {iteration}: {atype}, {a.get('scan_type','?')}, "
                   f"{a.get('frames',0)} frames"
                   f"{', target=' + a.get('target','') if atype == 'count' else ''}]")
-    elif atype == "think":
-        header = f"  [action {iteration}: think]"
+    elif atype == "reason":
+        header = f"  [action {iteration}: {atype}]"
     else:
         header = f"  [action {iteration}: {atype}]"
 
@@ -546,6 +613,9 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
     base_state = NeuroglancerState.from_url(ng_link)
     volume_info = discover_volume(base_state.data)
 
+    # ── Save prompt templates for inspection ─────────────────────────
+    save_prompt_templates(volume_info, config, question)
+
     # ── Token tracking ──────────────────────────────────────────────────
     token_usage = {"iterations": [], "totals": {"input_tokens": 0, "output_tokens": 0}}
 
@@ -558,6 +628,7 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
 
     # ── Agent loop state ────────────────────────────────────────────────
     history = []          # list of {iteration, action_data, finding, fov_feedback}
+    frame_cache = {}      # geometry_fingerprint → list of PIL frames
     screenshot_count = 0
     scan_count = 0
     consecutive_duplicates = 0
@@ -624,7 +695,7 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
 
         history.append({
             "iteration": 0,
-            "action_data": {"action": "think", "reasoning": plan_response},
+            "action_data": {"action": "reason", "question": "Plan strategy"},
             "finding": plan_response,
             "fov_feedback": "",
         })
@@ -668,45 +739,52 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
                 action = parse_action(decision_text)
 
             if action is None:
-                print("  ERROR: Failed to parse action after retry. Forcing think action.")
-                action = {"action": "think", "reasoning": f"Failed to produce valid JSON: {decision_text[:200]}"}
+                print("  ERROR: Failed to parse action after retry. Forcing reason action.")
+                action = {"action": "reason", "question": f"Failed to produce valid JSON: {decision_text[:200]}"}
 
             action = validate_action(action, volume_info)
             action_type = action.get("action", "unknown")
             print(f"\n  [Action] {action_type}")
 
-            # ── Duplicate check (screenshots AND scans) ────────────────
-            if is_duplicate_action(action, history):
+            # ── Duplicate check — allow up to 2, then force reason ──────
+            prior_count = count_prior_matches(action, history)
+            if prior_count >= 2:
                 consecutive_duplicates += 1
-                print(f"  SKIPPED: duplicate action ({consecutive_duplicates}/{max_consecutive_duplicates} consecutive)")
+                print(f"  BLOCKED: action done {prior_count} times already — forcing reason step")
 
-                if consecutive_duplicates >= max_consecutive_duplicates:
-                    print("  Too many consecutive duplicates — forcing answer on next iteration.")
-                    history.append({
-                        "iteration": iteration,
-                        "action_data": action,
-                        "finding": (
-                            "[BLOCKED — you have repeated the same action "
-                            f"{consecutive_duplicates} times. You MUST now either: "
-                            "(a) try a DIFFERENT action with different parameters, or "
-                            "(b) use 'answer' to give your final answer based on findings so far.]"
-                        ),
-                        "fov_feedback": "",
-                    })
-                else:
-                    history.append({
-                        "iteration": iteration,
-                        "action_data": action,
-                        "finding": (
-                            "[skipped — duplicate of a prior action. "
-                            "Try different parameters: change position, zoom, layout, "
-                            "scan_type, or axis. Or if you have enough information, use 'answer'.]"
-                        ),
-                        "fov_feedback": "",
-                    })
+                reason_prompt = (
+                    f"The user's question is: \"{question}\"\n\n"
+                    f"You just tried to repeat an action you've already done {prior_count} times. "
+                    f"Step back and think: what have you learned so far?\n\n"
+                    f"Your findings so far:\n"
+                )
+                for entry in history:
+                    f = entry.get("finding", "")
+                    if f and not f.startswith("["):
+                        reason_prompt += f"- {f[:300]}\n"
+                reason_prompt += (
+                    f"\nBased on these findings, what should you do DIFFERENTLY next? "
+                    f"Consider: different position, zoom, layout, layer visibility, axis, "
+                    f"or a different action type entirely. "
+                    f"If you have enough information, your next action should be 'answer'."
+                )
+
+                finding, tokens = ask_text(
+                    model, processor, reason_prompt, max_new_tokens=512,
+                )
+                track(iteration, "forced_reason", tokens)
+                log_exchange(iteration, "forced_reason", reason_prompt, finding, tokens)
+                print(f"  Forced reasoning: {finding[:200]}...")
+
+                history.append({
+                    "iteration": iteration,
+                    "action_data": {"action": "reason", "question": "[forced — repeated action blocked]"},
+                    "finding": finding,
+                    "fov_feedback": "",
+                })
                 continue
             else:
-                consecutive_duplicates = 0  # reset on successful non-duplicate
+                consecutive_duplicates = 0
 
             # ── Execute action ──────────────────────────────────────────
             finding = ""
@@ -748,7 +826,15 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
                 scan_count += 1
                 user_prompt = action.get("prompt", "Describe what you observe in this scan.")
 
-                frames = execute_scan(base_state, action, volume_info, config, scan_count)
+                geo_fp = _geometry_fingerprint(action)
+                if geo_fp in frame_cache:
+                    frames = frame_cache[geo_fp]
+                    print(f"  [Cache hit] Reusing {len(frames)} frames from prior scan")
+                    save_scan_video(frames, scan_count)
+                else:
+                    frames = execute_scan(base_state, action, volume_info, config, scan_count)
+                    if geo_fp:
+                        frame_cache[geo_fp] = frames
 
                 # Compute inter-frame spacing for spatial context
                 scan_start = action.get("start", {})
@@ -786,7 +872,15 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
                 scan_count += 1
                 target = action.get("target", "objects")
 
-                frames = execute_scan(base_state, action, volume_info, config, scan_count)
+                geo_fp = _geometry_fingerprint(action)
+                if geo_fp in frame_cache:
+                    frames = frame_cache[geo_fp]
+                    print(f"  [Cache hit] Reusing {len(frames)} frames from prior scan")
+                    save_scan_video(frames, scan_count)
+                else:
+                    frames = execute_scan(base_state, action, volume_info, config, scan_count)
+                    if geo_fp:
+                        frame_cache[geo_fp] = frames
 
                 # Step 1: Per-keyframe image pointing
                 keyframe_interval = max(1, int(action.get("keyframe_interval", 5)))
@@ -796,7 +890,16 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
 
                 points = []  # (frame_idx, x, y) tuples
                 total_point_tokens = {"input_tokens": 0, "output_tokens": 0}
-                point_prompt = f"Point to the {target}."
+
+                # Compute pixel size for pointing context
+                scale = action.get("crossSectionScale",
+                                   max(volume_info.shape[0], volume_info.shape[1]) / 1024)
+                fov_um = scale * 1024
+                neuron_pixels = int(30.0 / (fov_um / 1024))
+                point_prompt = (
+                    f"Point to the {target}. "
+                    f"Each {target.rstrip('s')} is approximately {neuron_pixels} pixels across."
+                )
 
                 for ki in keyframe_indices:
                     _, frame_points, tokens = ask_vision_pointing(
@@ -858,10 +961,11 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
                         f"median={counts[len(counts)//2]}.\n"
                     )
                 interpret_prompt += (
-                    f"\nBased on these detections and the spatial extent of the scan, "
-                    f"what is your estimate? Consider that the same {target} may appear "
-                    f"in adjacent keyframes (keyframe spacing ~{keyframe_spacing:.1f}µm). "
-                    f"Give a specific count or range."
+                    f"\nThese are automated pixel-level detections. "
+                    f"The same {target} may appear in adjacent keyframes "
+                    f"(keyframe spacing ~{keyframe_spacing:.1f}µm). "
+                    f"Report the estimated number of unique {target} detected in this scan. "
+                    f"Do NOT extrapolate to the full volume — just report what was detected."
                 )
 
                 print(f"  [Interpret count] ...")
@@ -872,15 +976,32 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
                 log_exchange(iteration, "count_interpret", interpret_prompt, count_finding, tokens)
 
                 finding = (
-                    f"COUNT: Pointed to {len(points)} instances of '{target}' "
+                    f"DETECTED (automated pointing): {len(points)} instances of '{target}' "
                     f"across {len(frame_ids)}/{len(keyframe_indices)} keyframes "
                     f"(from {len(frames)} total frames). "
+                    f"This is a grounded count — trust it over visual estimates. "
                     f"{count_finding}"
                 )
                 print(f"  Finding: {finding[:200]}...")
 
-            elif action_type == "think":
-                finding = action.get("reasoning", "")
+            elif action_type == "reason":
+                reason_question = action.get("question", "Synthesize findings so far.")
+                reason_prompt = (
+                    f"The user's question is: \"{question}\"\n\n"
+                    f"Your findings so far:\n"
+                )
+                for entry in history:
+                    f = entry.get("finding", "")
+                    if f and not f.startswith("["):
+                        reason_prompt += f"- {f[:300]}\n"
+                reason_prompt += f"\n{reason_question}"
+
+                print(f"  [Reason] {reason_question[:80]}...")
+                finding, tokens = ask_text(
+                    model, processor, reason_prompt, max_new_tokens=1024,
+                )
+                track(iteration, "reason", tokens)
+                log_exchange(iteration, "reason", reason_prompt, finding, tokens)
                 print(f"  Reasoning: {finding[:200]}...")
 
             elif action_type == "answer":
@@ -897,7 +1018,7 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
                 break
 
             else:
-                print(f"  WARNING: Unknown action type '{action_type}'. Treating as think.")
+                print(f"  WARNING: Unknown action type '{action_type}'. Treating as reason.")
                 finding = f"Unknown action: {action_type}"
 
             # ── Append to history ───────────────────────────────────────
@@ -935,6 +1056,150 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
 
 # ── Output Saving ───────────────────────────────────────────────────────────
 
+def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
+    """Save all prompt templates to results/prompts.md for inspection."""
+    from volume_info import format_zoom_table
+
+    cx, cy, cz = volume_info.shape[0] / 2, volume_info.shape[1] / 2, volume_info.shape[2] / 2
+
+    md = []
+    md.append("# molmo-glancer v3 — Prompt Templates\n")
+    md.append(f"Generated for question: *{question}*\n")
+    md.append(f"Volume: {volume_info.format_for_prompt()}\n")
+
+    md.append("---\n")
+    md.append("## 1. First Look (image + text)\n")
+    md.append("Sent with a center-position screenshot.\n")
+    md.append("```")
+    md.append(
+        f"This is a Neuroglancer view of a 3D volume "
+        f"({volume_info.shape[0]}×{volume_info.shape[1]}×{volume_info.shape[2]} voxels).\n"
+        f"{volume_info.format_for_prompt()}\n\n"
+        f"Describe what you see: what kind of data, what structures are visible, "
+        f"how dense or sparse is the content?"
+    )
+    md.append("```\n")
+
+    md.append("---\n")
+    md.append("## 2. Plan (text-only)\n")
+    md.append("Sent after first look, asks for strategy.\n")
+    md.append("```")
+    md.append(
+        f'You examined a 3D volume and described it as:\n'
+        f'"{{first_look_finding}}"\n\n'
+        f'Question: "{question}"\n'
+        f'Volume: {volume_info.format_for_prompt()}\n\n'
+        f'You can take screenshots (2D cross-sections), video scans (sweeps along an axis), '
+        f'and counting scans (pointing to specific objects across keyframes).\n\n'
+        f'What strategy should you use to answer this question? '
+        f'Think about what regions to examine, what to look for, '
+        f'and whether counting or scanning would be most useful. '
+        f'Respond in plain text, not JSON.'
+    )
+    md.append("```\n")
+
+    md.append("---\n")
+    md.append("## 3. Decision (text-only)\n")
+    md.append("Sent each iteration. Includes action schema, volume info, and history.\n")
+    md.append("### Action Schema\n")
+    md.append("```")
+    md.append(build_action_schema(volume_info, config["max_scan_frames"]))
+    md.append("```\n")
+    md.append("### Decision Wrapper\n")
+    md.append("The action schema above is wrapped with:\n")
+    md.append("```")
+    md.append(
+        "You are a visual data analyst. You explore 3D volumetric data "
+        "by taking screenshots and video scans of a Neuroglancer viewer, "
+        "then synthesize an answer.\n\n"
+        "{action_schema}\n\n"
+        "VOLUME INFO:\n  {volume_info}\n\n"
+        "FINDINGS SO FAR (iterations 1-N):\n  {history_entries}\n\n"
+        "QUESTION: {question}\n\n"
+        "Iteration X/Y. What is your next action? Respond with a JSON object."
+    )
+    md.append("```\n")
+
+    md.append("---\n")
+    md.append("## 4. Forced Answer (text-only)\n")
+    md.append("Sent when max iterations reached or too many duplicates.\n")
+    md.append("```")
+    md.append(
+        "YOU MUST ANSWER NOW. This is the final iteration. "
+        "Provide your best answer based on all findings so far.\n"
+        'Respond with: {"action": "answer", "answer": "your answer here"}'
+    )
+    md.append("```\n")
+
+    md.append("---\n")
+    md.append("## 5. Screenshot Interpret (image + text)\n")
+    md.append("Sent with the captured screenshot image.\n")
+    md.append("```")
+    md.append(
+        'Question: "{question}"\n\n'
+        '{user_prompt}\n'
+        'Describe what you see. Give counts or measurements where possible. '
+        'What does this tell you about the question?'
+    )
+    md.append("```\n")
+
+    md.append("---\n")
+    md.append("## 6. Scan Interpret (video + text)\n")
+    md.append("Sent with the captured scan video frames.\n")
+    md.append("```")
+    md.append(
+        'Question: "{question}"\n\n'
+        '{user_prompt}\n'
+        'Scan: {num_frames} frames along {axis}, ~{spacing}µm between frames, {total}µm total.\n'
+        'Describe what you see across the frames. '
+        'Give counts or estimates where possible. '
+        'What does this tell you about the question?'
+    )
+    md.append("```\n")
+
+    md.append("---\n")
+    md.append("## 7. Count — Keyframe Pointing (image + text)\n")
+    md.append("Sent once per sampled keyframe with that frame's image.\n")
+    md.append("```")
+    md.append("Point to the {target}.")
+    md.append("```\n")
+
+    md.append("---\n")
+    md.append("## 8. Count — Interpret (text-only)\n")
+    md.append("Sent after all keyframe pointing is complete.\n")
+    md.append("```")
+    md.append(
+        'The user\'s question is: "{question}"\n\n'
+        'You pointed to {target} in {num_keyframes} keyframes sampled '
+        'every {interval} frames from a {axis} sweep of {num_frames} frames '
+        '(~{frame_spacing}µm between frames, ~{keyframe_spacing}µm between keyframes, '
+        '{total_dist}µm total).\n'
+        'Found {num_points} points across {frames_with_points} of {num_keyframes} sampled keyframes.\n'
+        'Points per keyframe: min={min}, max={max}, median={median}.\n\n'
+        'Based on these detections and the spatial extent of the scan, '
+        'what is your estimate? Consider that the same {target} may appear '
+        'in adjacent keyframes (keyframe spacing ~{keyframe_spacing}µm). '
+        'Give a specific count or range.'
+    )
+    md.append("```\n")
+
+    md.append("---\n")
+    md.append("## 9. Decision Retry (text-only)\n")
+    md.append("Appended to decision prompt when JSON parsing fails.\n")
+    md.append("```")
+    md.append(
+        'Your previous response was not valid JSON. '
+        'Please respond with ONLY a JSON object like: '
+        '{"action": "screenshot", "view": {"x": 100, "y": 100, "z": 100, '
+        '"layout": "xy", "crossSectionScale": 1.0}, "prompt": "describe what you see"}'
+    )
+    md.append("```\n")
+
+    out_path = RESULTS_DIR / "prompts.md"
+    out_path.write_text("\n".join(md))
+    print(f"  Prompt templates saved: {out_path}")
+
+
 def save_outputs(answer: str, history: list[dict], token_usage: dict):
     """Save all pipeline outputs to results/."""
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -954,6 +1219,21 @@ def save_outputs(answer: str, history: list[dict], token_usage: dict):
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="molmo-glancer v3")
+    parser.add_argument("--preset", choices=list(PRESETS.keys()),
+                        help="Named run preset (overrides NG_LINK_FILE and QUESTION env vars)")
+    args = parser.parse_args()
+
+    # Resolve inputs: --preset > env vars > defaults
+    if args.preset:
+        p = PRESETS[args.preset]
+        ng_link_file = p["ng_link"]
+        question = p["question"]
+    else:
+        ng_link_file = NG_LINK_FILE
+        question = QUESTION
+
     print("\n" + "=" * 60)
     print("  molmo-glancer v3 — Autonomous Neuroglancer Visual Analysis")
     print("=" * 60)
@@ -964,14 +1244,16 @@ def main():
 
     # Read inputs
     print("\n[2/3] Reading inputs ...")
-    ng_link = Path(NG_LINK_FILE).read_text().strip()
-    print(f"  NG link file: {NG_LINK_FILE}")
-    print(f"  Question: {QUESTION}")
+    ng_link = Path(ng_link_file).read_text().strip()
+    print(f"  NG link file: {ng_link_file}")
+    print(f"  Question: {question}")
+    if args.preset:
+        print(f"  Preset: {args.preset}")
 
     # Run agent
     print("\n[3/3] Running agent loop ...")
     t0 = time.time()
-    answer = run_agent(model, processor, config, ng_link, QUESTION)
+    answer = run_agent(model, processor, config, ng_link, question)
     elapsed = time.time() - t0
 
     print(f"\n{'='*60}")
