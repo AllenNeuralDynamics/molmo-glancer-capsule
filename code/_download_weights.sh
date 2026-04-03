@@ -1,75 +1,53 @@
 #!/usr/bin/env bash
-# _download_weights.sh — Download model weights to /scratch
+# _download_weights_v2.sh — Download Molmo2-O-7B model weights to /scratch
 #
-# Downloads MolmoWeb-4B and OLMo-3-7B-Instruct directly to /scratch/checkpoints/.
-# HF cache is also redirected to /scratch to avoid filling the 5 GB root overlay.
+# Molmo2-O-7B: single model serving both visual interpretation and orchestration.
+# Backbone: OLMo3-7B-Instruct + SigLIP2 vision encoder (~14-16 GB on disk).
+# Runtime: ~8 GB in 8-bit quantization — fits on T4 (15 GB VRAM).
+#
+# HF_TOKEN is required to avoid anonymous rate limits.
 #
 # Usage:
-#   bash /code/_download_weights.sh
-#   bash /code/_download_weights.sh --skip-olmo    # skip OLMo (14 GB)
-#   bash /code/_download_weights.sh --skip-molmo   # skip MolmoWeb-4B (8 GB)
+#   export HF_TOKEN=hf_...
+#   bash /code/_download_weights_v2.sh
 
 set -euo pipefail
 
-SKIP_MOLMO=false
-SKIP_OLMO=false
-
-for arg in "$@"; do
-    case "$arg" in
-        --skip-molmo) SKIP_MOLMO=true ;;
-        --skip-olmo)  SKIP_OLMO=true ;;
-    esac
-done
-
-# Redirect HF hub cache to /scratch — prevents ~/.cache/huggingface/ filling root
+# Redirect HF cache to /scratch — keeps root overlay from filling up
 export HF_HOME=/scratch/hf-cache
 mkdir -p /scratch/checkpoints /scratch/hf-cache
 
-# HF_TOKEN must be set to avoid anonymous rate limits (429 errors).
-# Get a token at: huggingface.co → Settings → Access Tokens (read access)
-# Usage: export HF_TOKEN=hf_... && bash /code/_download_weights.sh
 if [ -z "${HF_TOKEN:-}" ]; then
-    echo "ERROR: HF_TOKEN is not set. Anonymous downloads are rate-limited."
+    echo "ERROR: HF_TOKEN is not set."
     echo "  export HF_TOKEN=hf_...  then re-run."
     exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# MolmoWeb-4B (~8 GB) — visual agent, fits on T4 (15 GB VRAM)
-# Do NOT download MolmoWeb-8B — it exceeds T4 VRAM
+# Molmo2-O-7B (~14-16 GB on disk, ~8 GB loaded in 8-bit)
+# Model ID: allenai/Molmo2-O-7B
+# Loaded at runtime via: AutoModelForImageTextToText with load_in_8bit=True
 # ---------------------------------------------------------------------------
-MOLMO_DEST=/scratch/checkpoints/MolmoWeb-4B
+MOLMO2_DEST=/scratch/checkpoints/Molmo2-O-7B
 
-if [ "$SKIP_MOLMO" = true ]; then
-    echo "--- MolmoWeb-4B skipped (--skip-molmo) ---"
-else
-    echo "--- MolmoWeb-4B (~8 GB, resumes if partial) ---"
-    huggingface-cli download allenai/MolmoWeb-4B \
-        --local-dir "$MOLMO_DEST"
-    echo "  Done: $MOLMO_DEST"
-fi
-
-# ---------------------------------------------------------------------------
-# OLMo-3-7B-Instruct (~14 GB) — text LLM for tool calling
-# ---------------------------------------------------------------------------
-OLMO_DEST=/scratch/checkpoints/OLMo-3-7B-Instruct
-
-if [ "$SKIP_OLMO" = true ]; then
-    echo "--- OLMo-3-7B-Instruct skipped (--skip-olmo) ---"
-else
-    echo "--- OLMo-3-7B-Instruct (~14 GB, resumes if partial) ---"
-    huggingface-cli download allenai/OLMo-3-7B-Instruct \
-        --local-dir "$OLMO_DEST"
-    echo "  Done: $OLMO_DEST"
-fi
+echo "--- Molmo2-O-7B (~14-16 GB, resumes if partial) ---"
+huggingface-cli download allenai/Molmo2-O-7B \
+    --local-dir "$MOLMO2_DEST"
+echo "  Done: $MOLMO2_DEST"
 
 # ---------------------------------------------------------------------------
 echo ""
 echo "=========================================="
 echo " Weights ready."
 echo ""
-echo " MolmoWeb-4B:         $MOLMO_DEST"
-echo " OLMo-3-7B-Instruct:  $OLMO_DEST"
+echo " Molmo2-O-7B: $MOLMO2_DEST"
 echo ""
-echo " Next: see CLAUDE.md 'Startup sequence' to launch services."
+echo " Load in Python:"
+echo "   from transformers import AutoProcessor, AutoModelForImageTextToText"
+echo "   model = AutoModelForImageTextToText.from_pretrained("
+echo "       '$MOLMO2_DEST',"
+echo "       trust_remote_code=True,"
+echo "       load_in_8bit=True,"
+echo "       device_map='auto',"
+echo "   )"
 echo "=========================================="

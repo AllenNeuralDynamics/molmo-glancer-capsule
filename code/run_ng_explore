@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-set -ex
-
-mkdir -p /results/ng_explore
-PLAYWRIGHT_BROWSERS_PATH=/scratch/ms-playwright python3 -u /code/ng_explore.py "$@" 2>&1 | tee /results/ng_explore/run_ng_explore.log
-
-# ./cleanup_ng_explore && clear && ./run_ng_explore --mode registration_large --record-video --max-steps 100

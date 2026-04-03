@@ -1,0 +1,13 @@
+{
+	"version": 1,
+	"attached_datasets": [
+		{
+			"id": "0441c810-b09e-42ca-8951-a0141a271011",
+			"mount": "molmo-glancer-v2-multi-step"
+		},
+		{
+			"id": "4f6389bc-6348-4564-8823-936c29784d3c",
+			"mount": "molmo2-tech-report-pdf"
+		}
+	]
+}
