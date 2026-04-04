@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# _download_weights_v2.sh — Download Molmo2-O-7B model weights to /scratch
+# _download_weights.sh — Download Molmo2-O-7B model weights to /scratch
 #
 # Molmo2-O-7B: single model serving both visual interpretation and orchestration.
 # Backbone: OLMo3-7B-Instruct + SigLIP2 vision encoder (~14-16 GB on disk).
-# Runtime: ~8 GB in 8-bit quantization — fits on T4 (15 GB VRAM).
+# Runtime: ~3.6 GB in 4-bit (T4) or ~14.5 GB in fp16 (L40S).
 #
 # HF_TOKEN is required to avoid anonymous rate limits.
 #
 # Usage:
 #   export HF_TOKEN=hf_...
-#   bash /code/_download_weights_v2.sh
+#   bash /code/_download_weights.sh
 
 set -euo pipefail
 
@@ -24,9 +24,9 @@ if [ -z "${HF_TOKEN:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Molmo2-O-7B (~14-16 GB on disk, ~8 GB loaded in 8-bit)
+# Molmo2-O-7B (~14-16 GB on disk)
 # Model ID: allenai/Molmo2-O-7B
-# Loaded at runtime via: AutoModelForImageTextToText with load_in_8bit=True
+# Loaded at runtime via: AutoModelForImageTextToText (4-bit or fp16, auto-detected)
 # ---------------------------------------------------------------------------
 MOLMO2_DEST=/scratch/checkpoints/Molmo2-O-7B
 
@@ -47,7 +47,6 @@ echo "   from transformers import AutoProcessor, AutoModelForImageTextToText"
 echo "   model = AutoModelForImageTextToText.from_pretrained("
 echo "       '$MOLMO2_DEST',"
 echo "       trust_remote_code=True,"
-echo "       load_in_8bit=True,"
 echo "       device_map='auto',"
 echo "   )"
 echo "=========================================="

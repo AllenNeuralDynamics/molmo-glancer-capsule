@@ -1,13 +1,13 @@
 """
-molmo-glancer v3 — Autonomous Neuroglancer Visual Analysis
-==========================================================
+molmo-glancer — Autonomous Neuroglancer Visual Analysis
+=======================================================
 Agent loop: model decides actions (screenshot, scan, count, reason, answer),
 system executes them (Playwright + NeuroglancerState), model interprets.
 Iterates until confident or max iterations reached.
 
 Usage:
     python3 -u /code/molmo_glancer.py
-    bash /code/run_v3              # preferred (sets env vars, logs output)
+    bash /code/run.sh              # preferred (sets env vars, logs output)
 """
 
 import json
@@ -612,15 +612,15 @@ def format_history_entry(entry: dict) -> str:
 # ── Agent Loop ──────────────────────────────────────────────────────────────
 
 def run_agent(model, processor, config: dict, ng_link: str, question: str):
-    """Run the v3 agent loop. Returns final answer string."""
-    from neuroglancer_chat.backend.tools.neuroglancer_state import NeuroglancerState
+    """Run the agent loop. Returns final answer string."""
+    from neuroglancer_state import NeuroglancerState
     from playwright.sync_api import sync_playwright
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Transcript log — full prompts and responses, appended live ─────
     transcript_path = RESULTS_DIR / "transcript.md"
-    transcript_path.write_text("# molmo-glancer v3 — Transcript\n\n")
+    transcript_path.write_text("# molmo-glancer — Transcript\n\n")
 
     def log_exchange(iteration, step, prompt, response, tokens=None, note=None):
         """Append a prompt/response pair to the transcript file."""
@@ -1088,7 +1088,7 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     cx, cy, cz = volume_info.shape[0] / 2, volume_info.shape[1] / 2, volume_info.shape[2] / 2
 
     md = []
-    md.append("# molmo-glancer v3 — Prompt Templates\n")
+    md.append("# molmo-glancer — Prompt Templates\n")
     md.append(f"Generated for question: *{question}*\n")
     md.append(f"Volume: {volume_info.format_for_prompt()}\n")
 
@@ -1245,7 +1245,7 @@ def save_outputs(answer: str, history: list[dict], token_usage: dict):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="molmo-glancer v3")
+    parser = argparse.ArgumentParser(description="molmo-glancer")
     parser.add_argument("--preset", choices=list(PRESETS.keys()),
                         help="Named run preset (overrides NG_LINK_FILE and QUESTION env vars)")
     args = parser.parse_args()
@@ -1260,7 +1260,7 @@ def main():
         question = QUESTION
 
     print("\n" + "=" * 60)
-    print("  molmo-glancer v3 — Autonomous Neuroglancer Visual Analysis")
+    print("  molmo-glancer — Autonomous Neuroglancer Visual Analysis")
     print("=" * 60)
 
     # Load model

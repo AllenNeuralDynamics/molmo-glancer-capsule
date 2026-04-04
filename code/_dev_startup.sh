@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# _dev_startup.sh — Install v3 project dependencies
+# _dev_startup.sh — Install project dependencies
 #
 # Run once at capsule startup (after /code is mounted).
 # The Docker image provides: Python 3.12, PyTorch+CUDA, boto3, ai2-olmo-core.
-# This script installs everything else needed for the v2 pipeline.
+# This script installs everything else needed for the pipeline.
 #
-# v3 stack:
+# Stack:
 #   - Molmo2-O-7B via HuggingFace transformers (agent loop, vision + video)
-#   - NeuroglancerState (neuroglancer-chat, URL builder only)
+#   - NeuroglancerState (inlined neuroglancer_state.py, URL builder only)
 #   - Playwright (headless screenshots + scan frames)
 #   - zarr/s3fs (volume metadata discovery)
 #   - imageio (scan video artifacts)
@@ -29,7 +29,7 @@ echo "--- pip upgrade ---"
 # ---------------------------------------------------------------------------
 # Molmo2-O-7B inference stack
 # transformers>=4.57.1 required for Molmo2 model code
-# bitsandbytes: 8-bit quantization (~8 GB on T4 vs ~16 GB fp32)
+# bitsandbytes: 4-bit NF4 quantization (~3.6 GB on T4) or fp16 on larger GPUs
 # decord2: video frame decoding (required by Molmo2 even for image-only use)
 # ---------------------------------------------------------------------------
 echo ""
@@ -79,15 +79,6 @@ echo "--- utility deps ---"
     s3fs \
     scikit-image \
     imageio[ffmpeg]
-
-# ---------------------------------------------------------------------------
-# neuroglancer-chat — editable install, no deps
-# We only import NeuroglancerState (pure stdlib internally).
-# All heavy deps (FastAPI, Panel, OpenAI, Polars) are intentionally excluded.
-# ---------------------------------------------------------------------------
-echo ""
-echo "--- neuroglancer-chat (editable, --no-deps) ---"
-"$PIP" install -q --no-cache-dir --no-deps -e /code/lib/neuroglancer-chat
 
 # ---------------------------------------------------------------------------
 echo ""

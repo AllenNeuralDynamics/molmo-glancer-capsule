@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
+# postInstall — runs after Docker image build.
+# Runtime dependencies are installed via _dev_startup.sh at capsule start.
 set -e
-
-# ERROS move these to dev startup
-# cd lib/neuroglancer-chat/
-# pip install -e .
-# cd -
-
-# cd lib/molmo-glancer/
-# pip install -e .
-# cd -
-
-# command not found
-# playwright install --with-deps chromium

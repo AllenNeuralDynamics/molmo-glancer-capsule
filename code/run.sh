@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# run.sh — v2 pipeline entry point
-#
-# Usage:
-#   bash /code/run.sh
-#   bash /code/run.sh --some-future-flag
+# run.sh — Entry point for molmo-glancer agent pipeline.
+# Sets environment, runs molmo_glancer.py, tees output to log.
 
 set -euo pipefail
 
-export PLAYWRIGHT_BROWSERS_PATH=/scratch/ms-playwright
-export HF_HOME=/scratch/hf-cache
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/scratch/ms-playwright}"
+export HF_HOME="${HF_HOME:-/scratch/huggingface}"
+export NEUROGLANCER_BASE="${NEUROGLANCER_BASE:-https://neuroglancer-demo.appspot.com}"
 
-python3 -u /code/run_capsule.py "$@" 2>&1 | tee /results/output.log
+RESULTS_DIR="${RESULTS_DIR:-/results}"
+mkdir -p "$RESULTS_DIR"
 
-# ./cleanup.sh && clear && ./run.sh 
+echo "=== molmo-glancer ==="
+echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
+echo "  VRAM: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
+echo "  Start: $(date -Iseconds)"
+echo ""
+
+python3 -u /code/molmo_glancer.py "$@" 2>&1 | tee "$RESULTS_DIR/output.log"

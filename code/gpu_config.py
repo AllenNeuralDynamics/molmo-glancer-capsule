@@ -1,5 +1,5 @@
 """
-gpu_config — GPU detection, profiles, and model loading for molmo-glancer v3.
+gpu_config — GPU detection, profiles, and model loading for molmo-glancer.
 
 Auto-detects hardware (T4 vs L40S) and selects quantization, resolution,
 and budget parameters accordingly. Same code, different config.
