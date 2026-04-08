@@ -15,6 +15,12 @@ Given an open-ended question about 3D neuroscience data in [Neuroglancer](https:
 
 All steps are driven by a single resident model — Molmo2-O-7B (7.76B parameters) — loaded once and used for text reasoning, visual interpretation, video understanding, and object pointing/counting.
 
+## Examples:
+
+See full output, transcripts, and artifacts from running the 'neurons' and 'alignment' presets here: 
+
+https://open.quiltdata.com/b/aind-scratch-data/tree/molmo-glancer/example_data/ 
+
 ## Architecture
 
 ```
@@ -153,7 +159,7 @@ All results are saved to `/results/`:
 
 This capsule was built during a hackathon and went through three major iterations:
 
-1. **MolmoWeb agent** — First attempt used MolmoWeb (the interactive web agent bundled with Molmo2) to directly browse Neuroglancer, clicking through the UI and taking screenshots autonomously. This proved impractical within the hackathon's time constraint — MolmoWeb's action loop was too slow, its server startup exceeded Code Ocean health-check timeouts, and controlling Neuroglancer's complex UI via click-based automation was unreliable.
+1. **MolmoWeb agent** — First attempt used MolmoWeb (the interactive web agent bundled with Molmo2) to directly browse Neuroglancer, clicking through the UI and taking screenshots autonomously. This proved impractical within the hackathon's time constraint, and controlling Neuroglancer's complex UI via click-based automation was unreliable.
 
 2. **Fixed pipeline** — Replaced the web agent with direct Molmo2 inference + Playwright screenshots. A rigid 9-step pipeline: plan all views up front, screenshot all, interpret all, synthesize. This worked but was inflexible — the model couldn't react to what it saw. In practice it produced near-identical views (only Z varied) with hallucinated findings, because the plan was committed before seeing any data.
 
