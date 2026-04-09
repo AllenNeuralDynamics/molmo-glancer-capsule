@@ -301,7 +301,7 @@ def main():
     from playwright.sync_api import sync_playwright
 
     ng_links_dir = Path(__file__).parent / "ng_links"
-    link_files = sorted(ng_links_dir.glob("*.txt"))
+    link_files = sorted(ng_links_dir.glob("*.json"))
 
     if len(sys.argv) > 1:
         pattern = sys.argv[1]
