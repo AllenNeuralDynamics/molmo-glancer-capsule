@@ -13,13 +13,14 @@ Usage:
     python _data_ready_simple.py example_ng_link  # single link by name
 """
 
+import base64
 import os
 import sys
 import time
+from io import BytesIO
 from pathlib import Path
 
 from PIL import Image
-from io import BytesIO
 
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/scratch/ms-playwright")
 
@@ -148,11 +149,26 @@ def probe(browser, ng_link: str, label: str) -> dict:
         pct = available / needed * 100 if needed > 0 else 0
         print(f"  → Ready at {ready_time:.1f}s ({available}/{needed}, {pct:.0f}%)")
 
-        # Hide UI chrome and screenshot the viewport
+        # Hide UI chrome then read the canvas directly via JS.
+        # Bypasses Playwright's screenshot machinery (which blocks on font/animation
+        # stabilisation and can timeout even when the canvas is fully rendered).
         page.add_style_tag(content=NG_HIDE_CSS)
         time.sleep(0.1)
 
-        png_bytes = page.screenshot()
+        data_url = page.evaluate("""() => {
+            const canvas = document.querySelector('canvas');
+            return canvas ? canvas.toDataURL('image/png') : null;
+        }""")
+        if not data_url:
+            print("  WARNING: no canvas found, skipping screenshot")
+            return {
+                "label": label, "result": "NO_CANVAS",
+                "ready_time": ready_time,
+                "chunks_available": available, "chunks_needed": needed,
+                "chunk_pct": pct, "screenshot": None,
+            }
+
+        png_bytes = base64.b64decode(data_url.split(",", 1)[1])
         img = Image.open(BytesIO(png_bytes)).convert("RGB")
 
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
