@@ -74,6 +74,19 @@ def probe(browser, ng_link: str, label: str) -> dict:
     context = browser.new_context(viewport={"width": 1024, "height": 1024})
     page = context.new_page()
 
+    # Patch WebGL context creation before the page loads so that
+    # preserveDrawingBuffer=true is set. Without this, the framebuffer is
+    # cleared after each composite and toDataURL() returns a black image.
+    page.add_init_script("""
+        const _origGetContext = HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext = function(type, attrs) {
+            if (type === 'webgl' || type === 'webgl2') {
+                attrs = Object.assign({}, attrs || {}, {preserveDrawingBuffer: true});
+            }
+            return _origGetContext.call(this, type, attrs);
+        };
+    """)
+
     try:
         page.goto(ng_link, wait_until="domcontentloaded", timeout=15000)
 
