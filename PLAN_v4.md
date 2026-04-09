@@ -108,7 +108,7 @@ Track OLMo context budget separately. Keep text prompts under 32K.
 The `max_context_tokens` in GPU profile stays at 55K for Molmo (vision);
 add `max_olmo_context_tokens: 32000` for text calls.
 
-### D5: Screenshot readiness — two-phase: CDP network idle → chunk stall
+### D5: Screenshot readiness — chunk-stability poll + JS canvas capture ✅ validated
 
 **Problem:** v3's pixel-polling readiness check (`_wait_for_canvas_stable`) captures
 screenshots before data is fully loaded. Pixel hashes can match during brief network
@@ -116,6 +116,7 @@ pauses while chunks are still streaming.
 
 **Discovery:** `window.viewer` IS accessible on neuroglancer-demo.appspot.com.
 `layerChunkProgressInfo` gives `numVisibleChunksNeeded` vs `numVisibleChunksAvailable`.
+This exposes exact readiness state directly — no need to infer from network traffic.
 
 **Key finding: `available` will NOT always reach `needed`.** Timeline probe (60s):
 
@@ -127,141 +128,39 @@ example_ng_link (4panel layout, single layer):
   ...60s: 319/400 (80%)  ← never changes
 ```
 
-The remaining 81 chunks are counted as "needed" but never fetched. Initially
-attributed to the 4panel layout, but other 4panel links (thyme_r2r, alignment_loop,
-example_r2r, large_ng_link) all reach 100%. The stall is specific to this zarr
-dataset — likely its chunking, resolution pyramid, or S3 serving behavior. 5 of 6
-preset links use 4panel; only segmentation uses a single-panel layout (yz).
+The remaining 81 chunks are counted as "needed" but never fetched — dataset-specific
+behaviour (chunking, resolution pyramid, or S3 serving). Other 4panel links all reach
+100%. The readiness check must handle plateau < 100% as a valid ready state.
 
-**Why every single-signal approach fails:**
+**Solution: chunk-stability poll.** Poll `(available, needed)` until the pair is
+unchanged for N consecutive reads. No CDP required — Neuroglancer already exposes
+readiness; there is nothing to infer from network events.
 
-| Approach | Weakness | Evidence |
-|----------|----------|----------|
-| Pixel hash stall | Network pause → identical frames → false ready | v3 bug reports |
-| Chunk count stall | Network pause → identical counts → false ready | Same root cause |
-| CDP network idle only | Misses post-download JS decoding | thyme_r2r: network idle at 1s, but only 14% of chunks available. NG fetches zarr in bulk (9 HTTP requests), then decompresses in JS for 4 more seconds |
-| Ratio threshold | Magic number — steady-state varies by dataset | example_ng_link: 80%, thyme_r2r: 100%, alignment_loop: 100% |
-
-**NG loading pipeline (observed):**
-
-```
-HTTP fetch (fast)           JS decode (slow)           Ready
-  9 requests → done ~1s  →  chunks 14% → 60% → 100%  →  ~5s
-                            ↑ no network activity here
-```
-
-NG fetches zarr data in bulk HTTP responses, then decompresses/decodes chunks in
-JavaScript *after* network transfer completes. CDP sees "idle" long before chunks
-are ready. Chunk counts see "stall" during network pauses before HTTP is done.
-
-**Solution: two-phase detection.** Each phase covers the other's weakness.
-
-```
-Phase 1: CDP network idle (1s)     →  "HTTP transfers are done"
-Phase 2: Chunk count stall (1.5s)  →  "JS decoding is done"
-```
-
-Phase 1 (CDP) is immune to network pauses — a paused request is still "pending."
-Phase 2 (chunk stall) starts only *after* CDP confirms network is idle, so there
-are no network pauses to worry about — all remaining chunk increases are from JS
-decoding already-downloaded data.
-
-**Validated: 6/6 preset links PASS.** Screenshots visually confirmed correct.
-
-| Link | Chunks | % | Ready | Screenshot |
-|------|--------|---|-------|------------|
-| alignment_loop | 70/70 | 100% | ~2s | correct |
-| ccf_cells | — | — | pending | — |
-| example_ng_link | 319/400 | 80% | ~5s | correct (dataset-specific stall) |
-| example_r2r_ng_link | 70/70 | 100% | ~2s | correct |
-| large_ng_link | 45/45 | 100% | ~2s | correct |
-| segmentation | 81/81 | 100% | ~2s | correct |
-| thyme_r2r_ng_link | 232/232 | 100% | ~6s | correct |
-
-Validation script: `code/probe_cdp_readiness.py` (delete before merging v4).
+- Handles plateau: 319/400 stable for 4 polls → ready (no 100% requirement)
+- Handles cache: data loaded with 0 HTTP requests → stable immediately, no
+  `completed_count > 0` gate to deadlock on
+- Handles streaming: counts keep changing → stable counter resets, waits longer
+- No event wiring, no `last_activity` tracking, no `pending` sets
 
 ```python
-def _wait_for_data_loaded(page, timeout_s: float = 60,
-                          net_idle_s: float = 1.0, chunk_stable_polls: int = 3,
-                          chunk_poll_ms: int = 500):
-    """Two-phase readiness: CDP network idle → chunk count stall.
-
-    Phase 1 — CDP network idle: wait until 0 pending HTTP requests for
-    `net_idle_s` seconds. This confirms all zarr data has been fetched.
-    Immune to network pauses (a paused request stays "pending").
-
-    Phase 2 — Chunk count stall: wait until `available` stops increasing
-    for `chunk_stable_polls` consecutive polls. This confirms NG has
-    finished decoding all downloaded chunks into GPU textures.
-    Safe because Phase 1 guarantees no network activity — any stall is
-    genuine processing completion, not a network pause.
-    """
-    # ── Phase 1: CDP network idle ──────────────────────────────────────
-    cdp = page.context.new_cdp_session(page)
-    cdp.send("Network.enable")
-
-    pending = set()
-    completed = [0]
-    last_activity = time.time()
-
-    def on_request(params):
-        nonlocal last_activity
-        pending.add(params["requestId"])
-        last_activity = time.time()
-
-    def on_finished(params):
-        nonlocal last_activity
-        pending.discard(params.get("requestId"))
-        completed[0] += 1
-        last_activity = time.time()
-
-    def on_failed(params):
-        nonlocal last_activity
-        pending.discard(params.get("requestId"))
-        completed[0] += 1
-        last_activity = time.time()
-
-    cdp.on("Network.requestWillBeSent", on_request)
-    cdp.on("Network.loadingFinished", on_finished)
-    cdp.on("Network.loadingFailed", on_failed)
-
+def _wait_for_data_loaded(page, timeout_s=60.0, stable_polls=4, poll_s=0.5):
+    """Wait until chunk counts (available, needed) are stable for stable_polls
+    consecutive reads. Handles both 100%-loaded and plateau cases."""
     t0 = time.time()
-    while time.time() - t0 < timeout_s:
-        time.sleep(0.25)
-        needed, available = _get_chunk_counts(page)
-        if available == 0:
-            continue
-        if len(pending) == 0 and completed[0] > 0 and (time.time() - last_activity) >= net_idle_s:
-            break
-    else:
-        cdp.detach()
-        print(f"  WARNING: network idle timeout ({len(pending)} pending)")
-        return
-
-    cdp.detach()
-    pct = available / needed * 100 if needed > 0 else 0
-    print(f"  Phase 1 done: network idle, chunks {available}/{needed} ({pct:.0f}%)")
-
-    # ── Phase 2: Chunk count stall ─────────────────────────────────────
-    prev_available = -1
+    prev = (-1, -1)
     stable_count = 0
-    remaining = timeout_s - (time.time() - t0)
 
-    t1 = time.time()
-    while time.time() - t1 < remaining:
+    while time.time() - t0 < timeout_s:
+        time.sleep(poll_s)
         needed, available = _get_chunk_counts(page)
-        if available == prev_available:
+        cur = (available, needed)
+        if cur == prev and needed > 0:
             stable_count += 1
-            if stable_count >= chunk_stable_polls:
-                pct = available / needed * 100 if needed > 0 else 0
-                print(f"  Phase 2 done: chunks stable {available}/{needed} ({pct:.0f}%)")
-                return
+            if stable_count >= stable_polls:
+                return  # ready
         else:
             stable_count = 0
-        prev_available = available
-        time.sleep(chunk_poll_ms / 1000)
-
-    print(f"  WARNING: chunk stability timeout ({available}/{needed})")
+        prev = cur
 
 
 def _get_chunk_counts(page) -> tuple[int, int]:
@@ -287,24 +186,66 @@ def _get_chunk_counts(page) -> tuple[int, int]:
     return (result["needed"], result["available"])
 ```
 
-**Why two-phase > any single signal:**
-- Phase 1 alone declares thyme_r2r ready at 14% — misses JS decoding
-- Phase 2 alone is fooled by network pauses during active loading
-- Together: Phase 1 confirms "no more data coming" → Phase 2 safely detects
-  "done processing" without false stalls from network interruptions
+**Screenshot capture: JS `canvas.toDataURL()` with `preserveDrawingBuffer` patch.**
 
-**Three-gate capture flow:**
-1. `_wait_for_data_loaded(page)` — two-phase: CDP idle → chunk stall
-2. One final pixel stability check (2 frames, 200ms) — catches WebGL rendering lag
-   after chunks arrive but before canvas redraws
-3. `_canvas_has_data()` sanity check — abort if canvas is still blank
+Playwright's `page.screenshot()` and `locator.screenshot()` block on internal page
+stabilisation (font loading, animation settling) and timeout even when the canvas is
+fully rendered. The root cause is Playwright's `wait_for_selector` / font-ready wait.
 
-**For scan frames (async path):** Same two-phase approach via async Playwright.
-Use `net_idle_s=0.5, chunk_stable_polls=2` since adjacent frames share ~90%
-chunks — less data per frame, faster turnaround.
+WebGL canvases return black from `toDataURL()` by default because `preserveDrawingBuffer`
+is `false` — the framebuffer is cleared immediately after compositing. Fix: patch
+`HTMLCanvasElement.prototype.getContext` via `add_init_script` *before* navigation so
+Neuroglancer's WebGL context is created with `preserveDrawingBuffer: true`. Then
+`toDataURL()` reads the live framebuffer directly, bypassing all Playwright machinery.
+
+```python
+# Must be called before page.goto()
+page.add_init_script("""
+    const _orig = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(type, attrs) {
+        if (type === 'webgl' || type === 'webgl2') {
+            attrs = Object.assign({}, attrs || {}, {preserveDrawingBuffer: true});
+        }
+        return _orig.call(this, type, attrs);
+    };
+""")
+
+# After _wait_for_data_loaded + CSS hide:
+data_url = page.evaluate("""() => {
+    const canvas = document.querySelector('canvas');
+    return canvas ? canvas.toDataURL('image/png') : null;
+}""")
+png_bytes = base64.b64decode(data_url.split(',', 1)[1])
+img = Image.open(BytesIO(png_bytes)).convert('RGB')
+```
+
+**Validated: 9/9 links PASS.** Screenshots visually confirmed correct.
+
+| Link | Chunks | % | Ready |
+|------|--------|---|-------|
+| alignment_loop | 70/70 | 100% | 3.1s |
+| ccf_cells | 362/362 | 100% | 52.8s |
+| ccf_ng | 596/596 | 100% | 6.9s |
+| example_ng_link | 319/400 | 80% | 7.6s (dataset plateau) |
+| example_r2r_ng_link | 70/70 | 100% | 3.2s |
+| large_ng_link | 45/45 | 100% | 2.5s |
+| segmentation | 81/81 | 100% | 3.1s |
+| smartspim_ng | 162/162 | 100% | 3.9s |
+| thyme_r2r_ng_link | 232/232 | 100% | 6.5s |
+
+Validation script: `code/_data_ready_simple.py` (keep as diagnostic tool).
+
+**Capture flow:**
+1. `add_init_script` to patch `getContext` with `preserveDrawingBuffer: true`
+2. `page.goto(ng_link)` — patch is in place before Neuroglancer initialises WebGL
+3. Wait for `needed > 0` (viewer warmup, up to 10s)
+4. `_wait_for_data_loaded(page)` — chunk-stability poll (4 × 0.5s)
+5. `page.add_style_tag(NG_HIDE_CSS)` — hide UI chrome
+6. `canvas.toDataURL('image/png')` via `page.evaluate` — direct framebuffer read
+7. `_canvas_has_data()` sanity check — abort if blank
 
 **File: `code/visual_capture.py`** — replace `_wait_for_canvas_stable` with
-`_wait_for_data_loaded` + final pixel gate.
+`_wait_for_data_loaded` + `toDataURL` capture; add `preserveDrawingBuffer` init script.
 
 ### D6: Multi-view planning — amortize swaps across views
 
@@ -500,18 +441,22 @@ Verify `ai2-olmo-core` version compatibility (currently 2.4.0 in Dockerfile).
 Check if OLMo 3.1 32B needs a newer version than 2.4.0. If so, bump in Dockerfile.
 If 3.1 loads purely via transformers (likely), this may not be needed at all.
 
-### 6. `code/visual_capture.py` — Two-phase readiness (D5) ✅ validated
+### 6. `code/visual_capture.py` — Chunk-stability readiness + JS canvas capture (D5) ✅ validated
 
-Replace pixel-polling readiness with two-phase CDP + chunk stall detection:
+Replace pixel-polling readiness and Playwright screenshot with chunk-stability poll
++ direct WebGL framebuffer read:
 - Add `_get_chunk_counts(page)` — JS eval returning `(needed, available)`
-- Add `_wait_for_data_loaded(page)` — Phase 1: CDP network idle (1s), Phase 2: chunk
-  count stall (3 × 500ms). Validated on all 6 preset links with visual confirmation.
+- Add `_wait_for_data_loaded(page)` — poll `(available, needed)` until stable for
+  4 consecutive 0.5s reads. Validated on all 9 preset links with visual confirmation.
 - Add `_async_wait_for_data_loaded(page)` — async version for scan frames
-  (`net_idle_s=0.5, chunk_stable_polls=2`)
-- Update `capture_screenshot()` — use `_wait_for_data_loaded` + final pixel gate
+  (`stable_polls=2` since adjacent frames share ~90% of chunks)
+- Add `preserveDrawingBuffer` init script to every new page (before `goto`) so
+  `canvas.toDataURL()` returns real content instead of black
+- Update `capture_screenshot()` — use `_wait_for_data_loaded` + `toDataURL` capture
 - Update `execute_scan()` / `_run_sequential()` — use async version for scan frames
 - Keep `_canvas_has_data` as sanity check (abort if canvas still blank after readiness)
-- Remove `_wait_for_canvas_stable` and `_async_wait_for_canvas_stable`
+- Remove `_wait_for_canvas_stable`, `_async_wait_for_canvas_stable`, and all
+  `page.screenshot()` / `locator.screenshot()` calls
 
 ### 7. `REFERENCES.md` — Add OLMo 3.1 sources ✅
 
@@ -523,12 +468,13 @@ and VRAM estimates table.
 Diagnostic scripts not needed in production:
 - `code/probe_ng_viewer.py`
 - `code/probe_chunk_timeline.py`
-- `code/probe_cdp_readiness.py`
+- `code/_data_ready_check.py` (two-phase CDP probe — superseded)
+- `code/_data_ready_simple.py` (chunk-stability probe — keep as diagnostic tool, do not ship in prod)
 
 ## Implementation Order
 
 1. ~~**REFERENCES.md** — add sources~~ ✅
-2. ~~**D5 validation** — two-phase readiness probe on all 6 links~~ ✅
+2. ~~**D5 validation** — chunk-stability poll + `preserveDrawingBuffer`/`toDataURL` capture, 9/9 links PASS~~ ✅
 3. **gpu_config.py** — strip compact profile, single CONFIG dict, `assert_gpu()` (D7)
 4. **visual_capture.py** — implement two-phase readiness + remove T4 branches (D5 + D7)
 5. **molmo_glancer.py** — remove `max_image_side` guards + T4 comments (D7)
