@@ -177,7 +177,6 @@ def probe_two_phase(browser, ng_link: str, label: str):
                       f"{failed_count[0]:>5}  {needed:>7}  {available:>6}  {pct:5.1f}%")
 
             if (len(pending) == 0
-                    and completed_count[0] > 0
                     and idle_elapsed >= NET_IDLE_S):
                 phase1_done = True
                 phase1_time = elapsed
