@@ -62,7 +62,7 @@ gets nearly the full 45 GB.
 - 34 GB fits in 45 GB with ~11 GB headroom for KV cache
 
 **No fallback quantization.** No Q5/Q4 side-by-side mode. INT8 swap or nothing.
-On compact profile (T4), OLMo is simply not loaded — Molmo handles everything (same as v3).
+v4 targets L40S exclusively — no T4/compact fallback (see D7).
 
 ### D2: Swap strategy — asymmetric (CPU for Molmo, disk for OLMo)
 
@@ -201,6 +201,7 @@ def _wait_for_data_loaded(page, timeout_s: float = 60,
     cdp.send("Network.enable")
 
     pending = set()
+    completed = [0]
     last_activity = time.time()
 
     def on_request(params):
@@ -211,11 +212,13 @@ def _wait_for_data_loaded(page, timeout_s: float = 60,
     def on_finished(params):
         nonlocal last_activity
         pending.discard(params.get("requestId"))
+        completed[0] += 1
         last_activity = time.time()
 
     def on_failed(params):
         nonlocal last_activity
         pending.discard(params.get("requestId"))
+        completed[0] += 1
         last_activity = time.time()
 
     cdp.on("Network.requestWillBeSent", on_request)
@@ -228,7 +231,7 @@ def _wait_for_data_loaded(page, timeout_s: float = 60,
         needed, available = _get_chunk_counts(page)
         if available == 0:
             continue
-        if len(pending) == 0 and (time.time() - last_activity) >= net_idle_s:
+        if len(pending) == 0 and completed[0] > 0 and (time.time() - last_activity) >= net_idle_s:
             break
     else:
         cdp.detach()
@@ -343,6 +346,42 @@ v4 decision output (action batch):
 - `answer` and `reason` actions are still single (they don't involve vision)
 - If OLMo returns a single action, treat it as a batch of 1 — backward compatible
 
+### D7: Drop T4 / compact profile support
+
+**Decision:** v4 targets L40S (45 GB) exclusively. Remove the compact (T4 / 15 GB)
+profile and all code paths that branch on it.
+
+**Why:**
+- v4's core value is the OLMo 32B reasoning model. On T4 (15 GB) OLMo can't load at
+  all — the capsule would fall back to Molmo-only, which is just v3. Maintaining a
+  "v4 that runs like v3" doubles the test surface for zero user benefit.
+- 4-bit NF4 quantization of Molmo (the compact path) masks vision quality issues that
+  aren't relevant to the L40S target. Debugging two quantization regimes wastes time.
+- The compact profile adds branching in gpu_config, visual_capture, and molmo_glancer
+  (image downscaling, max_image_side guards, profile detection, T4-specific Chromium
+  args). Removing it simplifies every file and the test matrix.
+- The `max_actions_per_plan=1` fallback for compact profile adds a parallel prompting
+  path (single-action schema + concrete JSON examples) that diverges from the batched
+  v4 design. One prompting path is easier to iterate on.
+
+**What to remove:**
+- `GPU_PROFILES["compact"]` dict and all `"4bit"` / `BitsAndBytesConfig` code in
+  `gpu_config.py`
+- `detect_gpu_profile()` — replace with a simple VRAM assertion (≥40 GB or abort)
+- `max_image_side` config key and all image-downscaling guards in `molmo_glancer.py`
+  (`ask_vision`, `ask_vision_pointing`) and `visual_capture.py` (`capture_screenshot`,
+  `execute_scan`)
+- T4-specific Chromium args (`_CHROMIUM_ARGS_BASE` vs `_CHROMIUM_ARGS_GPU` branching)
+  — always use GPU-accelerated rendering
+- References to "compact profile" in comments, docstrings, and `_dev_startup.sh` /
+  `_download_weights.sh`
+
+**What remains:**
+- A single `CONFIG` dict (renamed from `GPU_PROFILES["full"]`) with the L40S parameters
+- `load_model()` always loads Molmo fp16, no quantization
+- `ModelManager` always enables OLMo swap — no "skip swaps" branch
+- Chromium always launches with `--use-gl=egl`
+
 ## Architecture
 
 ### Current flow (v3)
@@ -397,18 +436,27 @@ compared to v3's one-view-at-a-time approach.
 
 ## Files to Change
 
-### 1. `code/gpu_config.py` — Model manager with swap support
+### 1. `code/gpu_config.py` — Rewrite: single profile + ModelManager
 
-Add:
+Remove:
+- `GPU_PROFILES` dict (both "compact" and "full" entries)
+- `detect_gpu_profile()` function
+- All 4-bit NF4 / `BitsAndBytesConfig` code paths
+- `max_image_side` config key
+- `_CHROMIUM_ARGS_BASE` vs `_CHROMIUM_ARGS_GPU` branching in `visual_capture.py`
+
+Replace with:
+- Single `CONFIG` dict with L40S parameters (fp16, no downscale, 20 iterations, etc.)
+- `assert_gpu()` — verify ≥40 GB VRAM or abort with clear error
 - `OLMO_CHECKPOINT` path constant (`/scratch/checkpoints/Olmo-3.1-32B-Think`)
 - `ModelManager` class:
-  - `load_molmo()` → load Molmo2 to GPU, returns (model, processor)
+  - `load_molmo()` → load Molmo2 fp16 to GPU, returns (model, processor)
   - `load_olmo()` → load OLMo 3.1 32B INT8 from disk to GPU, returns (model, tokenizer)
   - `swap_to_molmo()` → delete OLMo from GPU, move Molmo from CPU to GPU
   - `swap_to_olmo()` → move Molmo to CPU, load OLMo from disk to GPU (INT8)
   - `active_model` property → which model is currently on GPU
   - VRAM reporting after each swap
-- Only activate on "full" profile. On "compact" (T4): no OLMo, no swaps.
+- OLMo swap always enabled — no conditional branching
 
 ### 2. `code/molmo_glancer.py` — Agent loop integration
 
@@ -422,9 +470,9 @@ Modify:
     1. **OLMo plan phase** — `swap_to_olmo()`, call `ask_text_olmo()` to plan N actions
     2. **Molmo vision phase** — `swap_to_molmo()`, execute all N actions (capture + interpret each)
     3. **OLMo reason phase** — `swap_to_olmo()`, pass all N findings, decide next step or answer
-  - On "compact" profile: skip swaps, use Molmo for everything (same as v3)
+- Remove all `max_image_side` downscaling guards from `ask_vision`, `ask_vision_pointing`
 - `parse_action()` → extend to parse `{"actions": [...]}` batch format alongside
-  single `{"action": ...}` for backward compat
+  single `{"action": ...}` (a single action is treated as a batch of 1)
 - Decision prompt → instruct OLMo to return an `actions` array (1-4 views per batch);
   add `max_actions_per_plan` to config
 - `main()` → construct `ModelManager`, pass to `run_agent()`
@@ -481,13 +529,14 @@ Diagnostic scripts not needed in production:
 
 1. ~~**REFERENCES.md** — add sources~~ ✅
 2. ~~**D5 validation** — two-phase readiness probe on all 6 links~~ ✅
-3. **visual_capture.py** — implement two-phase readiness (can land independently of OLMo)
-4. **_download_weights.sh** — add OLMo download
-5. **gpu_config.py** — `ModelManager` with asymmetric swap logic
-6. **molmo_glancer.py** — `ask_text_olmo()` + agent loop integration
-7. **Test on T4** — verify compact profile still works (no OLMo, same as v3)
-8. **Test on L40S** — verify swap cycle, VRAM usage, generation quality
-9. **Delete probe scripts** — clean up before merge
+3. **gpu_config.py** — strip compact profile, single CONFIG dict, `assert_gpu()` (D7)
+4. **visual_capture.py** — implement two-phase readiness + remove T4 branches (D5 + D7)
+5. **molmo_glancer.py** — remove `max_image_side` guards + T4 comments (D7)
+6. **_download_weights.sh** — add OLMo download, remove T4 references
+7. **gpu_config.py** — add `ModelManager` with asymmetric swap logic
+8. **molmo_glancer.py** — `ask_text_olmo()` + agent loop integration + v4 prompting
+9. **Test on L40S** — verify swap cycle, VRAM usage, generation quality
+10. **Delete probe scripts** — clean up before merge
 
 ## Open Questions
 

@@ -176,7 +176,9 @@ def probe_two_phase(browser, ng_link: str, label: str):
                 print(f"  {elapsed:6.1f}  {len(pending):>8}  {completed_count[0]:>6}  "
                       f"{failed_count[0]:>5}  {needed:>7}  {available:>6}  {pct:5.1f}%")
 
-            if len(pending) == 0 and idle_elapsed >= NET_IDLE_S:
+            if (len(pending) == 0
+                    and completed_count[0] > 0
+                    and idle_elapsed >= NET_IDLE_S):
                 phase1_done = True
                 phase1_time = elapsed
                 pct = available / needed * 100 if needed > 0 else 0
@@ -249,7 +251,7 @@ def probe_two_phase(browser, ng_link: str, label: str):
         canvas = page.locator("canvas").first
         prev_hash = None
         for _ in range(5):
-            png_bytes = canvas.screenshot()
+            png_bytes = canvas.screenshot(timeout=60000)
             h = hashlib.md5(png_bytes).hexdigest()
             if h == prev_hash:
                 break
@@ -257,7 +259,7 @@ def probe_two_phase(browser, ng_link: str, label: str):
             time.sleep(0.2)
 
         # Capture final canvas screenshot
-        png_bytes = canvas.screenshot()
+        png_bytes = canvas.screenshot(timeout=60000)
         img = Image.open(BytesIO(png_bytes)).convert("RGB")
 
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
