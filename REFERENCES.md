@@ -1,6 +1,6 @@
 # Reference Index
 
-Sources used during v3 planning and Molmo2 capability audit. Grouped by topic.
+Sources used during v3/v4 planning, Molmo2 capability audit, and OLMo 3.1 reasoning model evaluation. Grouped by topic.
 
 ---
 
@@ -41,13 +41,46 @@ Sources used during v3 planning and Molmo2 capability audit. Grouped by topic.
 - [video_processing_molmo2.py](https://huggingface.co/allenai/Molmo2-O-7B/blob/main/video_processing_molmo2.py)
   Video processor source: `load_video()` accepts non-string inputs, frame sampling logic, `do_sample_frames`.
 
-## OLMo3 Backbone
+## OLMo3 Backbone (Molmo2's LLM)
 
 - [OLMo3 Blog Post (Allen AI)](https://allenai.org/blog/olmo3)
   OLMo3-7B-Instruct benchmarks: IFEval 85.6, MATH 87.3, MMLU 69.1, AIME 44.3.
 
 - [allenai/OLMo-3-7B-Instruct — HuggingFace](https://huggingface.co/allenai/Olmo-3-7B-Instruct)
   Model card, architecture details.
+
+## OLMo 3.1 32B Think (v4 reasoning model)
+
+- [allenai/Olmo-3.1-32B-Think — HuggingFace Model Card](https://huggingface.co/allenai/Olmo-3.1-32B-Think)
+  Flagship reasoning model. 32B params, 64 layers, 40 KV heads, max 32K context.
+  MMLU 86.4, MATH 96.2, AIME '25 78.1, HumanEvalPlus 91.5, IFEval 93.8.
+
+- [allenai/Olmo-3.1-32B-Instruct — HuggingFace](https://huggingface.co/allenai/Olmo-3.1-32B-Instruct)
+  Non-thinking variant. Faster inference, slightly lower reasoning scores.
+
+- [OLMo 3 Blog Post (Allen AI)](https://allenai.org/blog/olmo3)
+  Architecture, Dolma 3 training data (6T tokens), Think vs Instruct comparison.
+
+- [OLMo 2 32B Blog Post (Allen AI)](https://allenai.org/blog/olmo2-32B)
+  OLMo 2 32B training details. Predecessor to OLMo 3/3.1 32B line.
+
+- [allenai/Olmo-3-7B-Think — HuggingFace](https://huggingface.co/allenai/Olmo-3-7B-Think)
+  7B Think variant. MATH 95.1, AIME '24 71.6. Lightweight reasoning alternative.
+
+- [unsloth/Olmo-3.1-32B-Think-GGUF — HuggingFace](https://huggingface.co/unsloth/Olmo-3.1-32B-Think-GGUF)
+  Pre-quantized GGUF weights. Q8_0 (~34 GB), Q5_K_M (~23 GB), Q4_K_M (~20 GB).
+
+- [bartowski/allenai_Olmo-3.1-32B-Think-GGUF — HuggingFace](https://huggingface.co/bartowski/allenai_Olmo-3.1-32B-Think-GGUF)
+  Alternative GGUF quantizations with imatrix calibration.
+
+### v4 VRAM estimates (L40S 45 GB)
+
+| Config                | Weights   | Fits swap? | Fits side-by-side (31 GB)? |
+|-----------------------|-----------|:----------:|:--------------------------:|
+| OLMo 3.1 32B BF16    | ~64 GB    | NO         | NO                         |
+| OLMo 3.1 32B Q8      | ~34 GB    | YES        | NO                         |
+| OLMo 3.1 32B Q5_K_M  | ~23 GB    | YES        | YES                        |
+| OLMo 3.1 32B Q4_K_M  | ~20 GB    | YES        | YES                        |
 
 ## Vision Encoder
 
@@ -132,4 +165,4 @@ Sources used during v3 planning and Molmo2 capability audit. Grouped by topic.
 
 ---
 
-*Compiled 2026-04-01 during v3 planning. Updated 2026-04-02 with Playwright/NG capture research.*
+*Compiled 2026-04-01 during v3 planning. Updated 2026-04-02 with Playwright/NG capture research. Updated 2026-04-09 with OLMo 3.1 32B Think references for v4.*
