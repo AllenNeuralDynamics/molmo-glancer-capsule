@@ -171,6 +171,7 @@ decoding already-downloaded data.
 | Link | Chunks | % | Ready | Screenshot |
 |------|--------|---|-------|------------|
 | alignment_loop | 70/70 | 100% | ~2s | correct |
+| ccf_cells | — | — | pending | — |
 | example_ng_link | 319/400 | 80% | ~5s | correct (dataset-specific stall) |
 | example_r2r_ng_link | 70/70 | 100% | ~2s | correct |
 | large_ng_link | 45/45 | 100% | ~2s | correct |
