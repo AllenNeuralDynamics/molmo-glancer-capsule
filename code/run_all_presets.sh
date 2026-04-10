@@ -11,6 +11,9 @@
 
 set -euo pipefail
 
+rm -rf /results/*
+rm -rf /scratch/*
+
 PRESETS=(neurons alignment neurons_large alignment_loop segmentation)
 TOTAL_START=$(date +%s)
 
