@@ -5,7 +5,6 @@
 #   bash run.sh --preset neurons        # single preset
 #   bash run.sh --preset all            # all presets with stashing
 #
-# Always runs dev startup first.
 # When --preset all:
 #   1. Runs each preset, stashing results after each
 #   2. Unstashes all into /results/<preset_name>/
@@ -25,9 +24,6 @@ echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || 
 echo "  VRAM: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
 echo "  Start: $(date -Iseconds)"
 echo ""
-
-# ── Dev startup (always) ──────────────────────────────────────────────────
-bash /code/_dev_startup.sh
 
 # ── Check if --preset all ────────────────────────────────────────────────
 PRESET_ARG=""

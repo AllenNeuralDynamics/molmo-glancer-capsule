@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # postInstall — runs after Docker image build.
-# Runtime dependencies are installed via _dev_startup.sh at capsule start.
+# Runs after Docker image build — installs deps not available in Code Ocean UI.
 set -e
 
 pip3 install --no-cache-dir torchvision --upgrade --extra-index-url https://download.pytorch.org/whl/cu124

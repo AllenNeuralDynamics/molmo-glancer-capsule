@@ -83,15 +83,11 @@ The capsule auto-detects GPU hardware and selects the appropriate profile:
 ## Quick start
 
 ```bash
-# 1. Install dependencies
-bash /code/_dev_startup.sh
-
-# 2. Download Molmo2-O-7B weights (~14-16 GB, requires HF_TOKEN)
-export HF_TOKEN=hf_...
-bash /code/_download_weights.sh
-
-# 3. Run with a preset
+# Run with a preset (dependencies are baked into the Docker image)
 bash /code/run.sh --preset neurons
+
+# Run all presets sequentially with stashing
+bash /code/run.sh --preset all
 ```
 
 ### Presets
@@ -120,24 +116,30 @@ PLAYWRIGHT_BROWSERS_PATH=/scratch/ms-playwright \
 
 ```
 code/
-├── molmo_glancer.py       # Agent loop (decision → execute → interpret)
-├── gpu_config.py          # GPU auto-detection, profiles, model loading
+├── molmo_glancer.py       # Agent loop + CLI entry point
+├── inference.py           # Molmo2 + OLMo model inference wrappers
+├── prompts.py             # Prompt construction for all agent steps
+├── actions.py             # Action JSON parsing, validation, dedup
+├── gpu_config.py          # GPU validation, config, model loading
 ├── visual_capture.py      # Playwright screenshots, scans, point annotation
 ├── volume_info.py         # Volume metadata discovery, FOV computation
-├── run.sh                 # Shell entry point (sets env, tees log)
 ├── neuroglancer_state.py  # NeuroglancerState URL builder (inlined)
-├── _dev_startup.sh        # Dependency installation
-├── _download_weights.sh   # Model weight download
-└── ng_links/              # Test Neuroglancer URLs
+├── run.sh                 # Shell entry point (sets env, tees log)
+├── presets/               # Run presets (JSON: ng_link + question)
+│   ├── neurons.json
+│   ├── alignment.json
+│   ├── neurons_large.json
+│   ├── alignment_loop.json
+│   └── segmentation.json
+└── ng_links/              # Neuroglancer state URLs
     ├── example_ng_link.txt
     ├── example_r2r_ng_link.txt
     ├── large_ng_link.txt
-    ├── thyme_r2r_ng_link.txt
     └── alignment_loop.txt
 
 environment/
 ├── Dockerfile             # Base: pytorch 2.4 + CUDA 12.4 + Python 3.12
-└── postInstall            # Post-install hooks
+└── postInstall            # torchvision upgrade + Playwright browser install
 ```
 
 ## Output artifacts
