@@ -150,11 +150,12 @@ class ModelManager:
         self._unload_all()
 
         self.molmo_processor = AutoProcessor.from_pretrained(
-            MOLMO_CHECKPOINT, trust_remote_code=True,
+            MOLMO_CHECKPOINT, trust_remote_code=True, local_files_only=True,
         )
         self.molmo_model = AutoModelForImageTextToText.from_pretrained(
             MOLMO_CHECKPOINT,
             trust_remote_code=True,
+            local_files_only=True,
             torch_dtype=CONFIG["torch_dtype"],
             device_map="auto",
             low_cpu_mem_usage=True,
@@ -180,11 +181,12 @@ class ModelManager:
         self._unload_all()
 
         self.olmo_tokenizer = AutoTokenizer.from_pretrained(
-            OLMO_CHECKPOINT, trust_remote_code=True,
+            OLMO_CHECKPOINT, trust_remote_code=True, local_files_only=True,
         )
         self.olmo_model = AutoModelForCausalLM.from_pretrained(
             OLMO_CHECKPOINT,
             trust_remote_code=True,
+            local_files_only=True,
             device_map="auto",
             low_cpu_mem_usage=True,
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
