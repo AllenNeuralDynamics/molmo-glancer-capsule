@@ -1,12 +1,10 @@
-# hash:sha256:678951de7ea503e234709734e45223b372ca8c77575929021661358a639a5443
+# hash:sha256:2c9cbcaaeaaf9dea451efe15a432df349c9c7807005e35be2e171a1456d40645
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/pytorch:2.4.0-cuda12.4.0-mambaforge24.5.0-0-python3.12.4-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG GIT_ASKPASS
 COPY git-ask-pass /
-
-ENV HF_TOKEN=REDACTED
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

@@ -43,11 +43,5 @@
 			],
 			"version": "4.100.3"
 		}
-	},
-	"env_variables": [
-		{
-			"name": "HF_TOKEN",
-			"value": "REDACTED"
-		}
-	]
+	}
 }
