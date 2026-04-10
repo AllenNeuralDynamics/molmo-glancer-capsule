@@ -146,7 +146,7 @@ def _wait_for_data_loaded(page, timeout_s=TIMEOUT_S, stable_polls=STABLE_POLLS,
         time.sleep(poll_s)
         needed, available = _get_chunk_counts(page)
         cur = (available, needed)
-        if cur == prev and needed > 0:
+        if cur == prev and needed > 0 and available > 0:
             stable_count += 1
             if stable_count >= stable_polls:
                 pct = available / needed * 100 if needed > 0 else 0
@@ -156,7 +156,9 @@ def _wait_for_data_loaded(page, timeout_s=TIMEOUT_S, stable_polls=STABLE_POLLS,
             stable_count = 0
         prev = cur
 
-    print(f"    WARNING: chunk stability timeout after {timeout_s}s")
+    pct = available / needed * 100 if needed > 0 else 0
+    print(f"    WARNING: chunk stability timeout after {timeout_s}s "
+          f"({available}/{needed}, {pct:.0f}%)")
 
 
 async def _async_wait_for_data_loaded(page, timeout_s=TIMEOUT_S,
@@ -187,7 +189,7 @@ async def _async_wait_for_data_loaded(page, timeout_s=TIMEOUT_S,
         if result is None:
             continue
         cur = (result["available"], result["needed"])
-        if cur == prev and result["needed"] > 0:
+        if cur == prev and result["needed"] > 0 and result["available"] > 0:
             stable_count += 1
             if stable_count >= stable_polls:
                 return
