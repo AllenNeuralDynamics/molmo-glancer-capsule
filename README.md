@@ -108,8 +108,7 @@ export QUESTION="Describe the structures visible in this volume."
 bash /code/run.sh
 
 # Via direct invocation
-PLAYWRIGHT_BROWSERS_PATH=/scratch/ms-playwright \
-  python3 -u /code/molmo_glancer.py --preset neurons
+python3 -u /code/molmo_glancer.py --preset neurons
 ```
 
 ## Repository structure

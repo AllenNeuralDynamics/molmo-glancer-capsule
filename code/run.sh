@@ -12,7 +12,6 @@
 
 set -euo pipefail
 
-export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/scratch/ms-playwright}"
 export HF_HOME="${HF_HOME:-/scratch/huggingface}"
 export NEUROGLANCER_BASE="${NEUROGLANCER_BASE:-https://neuroglancer-demo.appspot.com}"
 
