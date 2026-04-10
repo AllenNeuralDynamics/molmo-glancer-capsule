@@ -156,6 +156,7 @@ class ModelManager:
             trust_remote_code=True,
             torch_dtype=CONFIG["torch_dtype"],
             device_map="auto",
+            low_cpu_mem_usage=True,
         )
         self.active = "molmo"
 
@@ -184,6 +185,7 @@ class ModelManager:
             OLMO_CHECKPOINT,
             trust_remote_code=True,
             device_map="auto",
+            low_cpu_mem_usage=True,
             quantization_config=BitsAndBytesConfig(load_in_8bit=True),
         )
         self.active = "olmo"

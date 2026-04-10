@@ -110,9 +110,7 @@ Your partner is a vision model (Molmo2) that captures and interprets
 screenshots and video scans of the data. You cannot see images directly.
 You plan what views to capture, and Molmo2 reports back what it sees.
 
-Keep your thinking brief. Respond directly with the requested format:
-- For plans and reasoning: use concise natural language (2-5 sentences).
-- For action decisions: output ONLY a JSON object, no other text."""
+Keep your thinking brief. Respond directly and concisely in plain language."""
 
 
 def strip_think_tokens(text: str) -> tuple[str, str, bool]:
@@ -719,8 +717,8 @@ def build_action_prompt(plan_text, volume_info, config):
     return (
         f"YOUR INVESTIGATION PLAN:\n{plan_text}\n\n"
         f"{schema}\n\n"
-        f"Output the JSON action that executes your plan. Include a \"purpose\" field\n"
-        f"explaining what you expect to learn from this view.\n\n"
+        f"Output ONLY the JSON action object that executes your plan — no other text.\n"
+        f"Include a \"purpose\" field explaining what you expect to learn.\n\n"
         f"If you already have enough evidence, use the answer action instead."
     )
 
@@ -739,12 +737,13 @@ def build_vision_instructions_prompt(action, question, findings_text):
         return (
             f"You have planned a count action:\n{action_summary}\n\n"
             f"PURPOSE: {purpose}\nTARGET: \"{target}\"\n\n"
-            f"The vision model will point to each instance of the target on sampled keyframes.\n"
-            f"Refine the target description to help the model identify the right objects:\n"
+            f"The vision model will be told: \"Point to each {target}.\"\n"
+            f"Refine the target description to help it identify the right objects:\n"
             f"- What size and shape are the targets?\n"
             f"- What intensity or color distinguishes them from background?\n"
             f"- Should the model ignore any similar-looking artifacts?\n\n"
-            f"Output a refined pointing instruction (1-2 sentences)."
+            f"Output a short refinement (1-2 sentences) that will be appended after\n"
+            f"\"Point to each {target}.\" — do not repeat that prefix."
         )
     return (
         f"You have planned this view:\n{action_summary}\n\n"
@@ -815,9 +814,10 @@ def build_reasoning_prompt(question, finding, findings_text, iteration,
         f"1. Does this finding confirm, contradict, or extend previous findings?\n"
         f"2. What spatial regions remain unexplored?\n"
         f"3. Do you have sufficient evidence to answer the question confidently?\n\n"
-        f"If you have enough evidence, respond with your answer:\n"
-        f'{{\"action\": \"answer\", \"answer\": \"...\"}}\n\n'
-        f"Otherwise, summarize your current understanding and what remains uncertain."
+        f"Respond in plain language (2-5 sentences). Summarize your current understanding\n"
+        f"and what remains uncertain.\n\n"
+        f"ONLY if you have enough evidence to give a final answer, respond instead with:\n"
+        f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}'
     )
 
 
@@ -833,9 +833,10 @@ def build_count_reasoning_prompt(question, target, pointing_stats, findings_text
         f"- Account for double-counting (objects spanning multiple z-slices)\n"
         f"- Keyframe spacing vs object size: if spacing < diameter, expect overcounting\n"
         f"- Detection confidence: low-contrast or partial objects may be missed\n\n"
-        f"Then decide: enough evidence to answer, or need more investigation?\n\n"
-        f"If you have enough evidence, respond with your answer:\n"
-        f'{{\"action\": \"answer\", \"answer\": \"...\"}}'
+        f"Respond in plain language (2-5 sentences). Summarize what the counts mean\n"
+        f"and whether you need more investigation.\n\n"
+        f"ONLY if you have enough evidence to give a final answer, respond instead with:\n"
+        f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}'
     )
 
 
@@ -1296,10 +1297,14 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 print(f"  [Step 5] Pointing to '{target}' on "
                       f"{len(keyframe_indices)} keyframes ...")
 
-                # Use OLMo instructions as refined pointing prompt
-                point_prompt = (olmo_instructions.strip()
-                                if olmo_instructions.strip()
-                                else f"Point to the {target}.")
+                # Build pointing prompt: always start with "Point to each"
+                # so Molmo2 produces coordinates, then append OLMo's
+                # refinement for specificity.
+                refinement = olmo_instructions.strip()
+                if refinement:
+                    point_prompt = f"Point to each {target}. {refinement}"
+                else:
+                    point_prompt = f"Point to each {target}."
 
                 points = []
                 total_point_tokens = {"input_tokens": 0, "output_tokens": 0}
@@ -1559,7 +1564,7 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     md.append(
         'YOUR INVESTIGATION PLAN:\n{plan_text}\n\n'
         '{action_schema}\n\n'
-        'Output the JSON action that executes your plan. '
+        'Output ONLY the JSON action object that executes your plan — no other text.\n'
         'Include a "purpose" field explaining what you expect to learn.\n\n'
         'If you already have enough evidence, use the answer action instead.'
     )
