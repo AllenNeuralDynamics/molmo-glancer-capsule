@@ -3,8 +3,6 @@ set -ex
 
 # This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
 
-The previous version of this file was commented-out and follows below:
-
 #!/usr/bin/env bash
 # run.sh — Entry point for molmo-glancer agent pipeline.
 # Sets environment, runs molmo_glancer.py, tees output to log.
