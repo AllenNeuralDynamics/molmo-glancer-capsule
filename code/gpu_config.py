@@ -39,13 +39,13 @@ CONFIG = {
     "olmo_max_new_tokens_retry": 8192,
     # Hard cap for any single call
     "olmo_max_new_tokens_hard_cap": 16384,
-    # OLMo sampling — per HF model card: temp=0.6, top_p=0.95
+    # OLMo sampling — base model card: temp=0.6; bumped to 0.7 for richer reasoning
     "olmo_sampling_structured": {
-        "temperature": 0.6, "top_p": 0.95,
+        "temperature": 0.7, "top_p": 0.95,
         "repetition_penalty": 1.1, "do_sample": True,
     },
     "olmo_sampling_synthesis": {
-        "temperature": 0.6, "top_p": 0.95,
+        "temperature": 0.7, "top_p": 0.95,
         "repetition_penalty": 1.1, "do_sample": True,
     },
     "olmo_sampling_retry": {
@@ -54,7 +54,7 @@ CONFIG = {
     },
     # Agent loop
     "max_agent_iterations": 20,
-    "min_iterations_before_answer": 3,
+    "min_iterations_before_answer": 2,
 }
 
 MIN_VRAM_GB = 40

@@ -217,7 +217,7 @@ Your partner is a vision model (Molmo2) that captures and interprets
 screenshots and video scans of the data. You cannot see images directly.
 You plan what views to capture, and Molmo2 reports back what it sees.
 
-Keep your thinking brief. Respond directly and concisely in plain language."""
+Think carefully about what each finding means before deciding your next step."""
 
 
 def strip_think_tokens(text: str) -> tuple[str, str, bool]:

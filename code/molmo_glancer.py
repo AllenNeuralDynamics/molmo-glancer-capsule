@@ -20,7 +20,7 @@ import numpy as np
 from gpu_config import ModelManager, get_vram_usage, CONFIG
 from volume_info import (
     VolumeInfo, discover_volume, format_fov_feedback,
-    pixel_to_physical, summarize_spatial_distribution, format_zoom_table,
+    pixel_to_physical, summarize_spatial_distribution,
 )
 from visual_capture import (
     build_clean_state, capture_screenshot, execute_scan,
@@ -79,7 +79,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
 
     4-step iteration:
         1. OLMo (think=True):  reason over last finding + plan next action
-        2. OLMo (think=False): action JSON (with vision_prompt) from schema
+        2. OLMo (think=False): action JSON (with prompt) from schema
         3. System: capture view (screenshot / scan / count frames)
         4. Molmo2: interpret the captured view
 
@@ -196,8 +196,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             f"This is a Neuroglancer view of a 3D volume "
             f"({volume_info.shape[0]}\u00d7{volume_info.shape[1]}\u00d7{volume_info.shape[2]} voxels).\n"
             f"{volume_info.format_for_prompt()}\n\n"
-            f"Describe what you see: what kind of data, what structures are visible, "
-            f"how dense or sparse is the content?"
+            f"Describe what you see, focusing on what's relevant to the question:\n"
+            f"\"{question}\""
         )
         t0 = time.time()
         first_look_finding, tokens = ask_vision(
@@ -236,9 +236,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             print("\n  [Step 1] OLMo: Reason + Plan ...")
             plan_prompt = build_plan_prompt(
                 question, volume_info, first_look_finding, findings_text,
-                iteration, max_iter,
+                iteration,
                 last_finding=last_finding, last_fov=last_fov,
-                min_iter=min_iter,
             )
             t0 = time.time()
             plan_text, tokens, _ = ask_text_olmo(
@@ -288,7 +287,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     })
                     break
 
-            # ── Step 2: OLMo action + vision_prompt (think=False) ────
+            # ── Step 2: OLMo action + prompt (think=False) ────────
             print("\n  [Step 2] OLMo: Action decision ...")
             action_prompt = build_action_prompt(plan_text, volume_info, config)
             t0 = time.time()
@@ -339,8 +338,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             action_type = action.get("action", "unknown")
             print(f"\n  [Action] {action_type}")
 
-            # Extract vision_prompt from action JSON (merged from old step 3)
-            olmo_instructions = action.pop("vision_prompt", "")
+            # Extract prompt for vision model from action JSON
+            olmo_instructions = action.pop("prompt", "") or action.pop("vision_prompt", "")
             target_refinement = action.pop("target_refinement", "")
 
             # ── Short-circuit: answer ────────────────────────────────
@@ -687,10 +686,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
         synth_prompt = (
             f"QUESTION: \"{question}\"\n\n"
             f"INVESTIGATION COMPLETE \u2014 ALL FINDINGS:\n{findings_text}\n\n"
-            f"You have reached the maximum number of iterations.\n"
             f"Synthesize ALL findings into a comprehensive answer.\n"
-            f"Be specific: include counts, spatial descriptions, "
-            f"and confidence level."
+            f"Be specific and cite evidence from your observations."
         )
         t0 = time.time()
         answer_text, tokens, _ = ask_text_olmo(
@@ -745,8 +742,8 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
         f"({volume_info.shape[0]:.0f}\u00d7{volume_info.shape[1]:.0f}"
         f"\u00d7{volume_info.shape[2]:.0f} \u00b5m).\n"
         f"{volume_info.format_for_prompt()}\n\n"
-        f"Describe what you see: what kind of data, what structures are visible, "
-        f"how dense or sparse is the content?"
+        f"Describe what you see, focusing on what's relevant to the question:\n"
+        f"\"{question}\""
     )
     md.append("```\n")
 
@@ -767,8 +764,7 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
         f'QUESTION: "{question}"\n\n'
         'LATEST FINDING (iteration N-1):\n{last_finding}\n\n'
         'INVESTIGATION SO FAR:\n{findings_text}\n\n'
-        'PART 1 — REASONING: Analyze the latest finding in context.\n'
-        'PART 2 — PLAN: What should you investigate next?\n\n'
+        'Analyze the latest finding in context, then decide what to investigate next.\n\n'
         'If enough evidence: {"action": "answer", "answer": "..."}'
     )
     md.append("```\n")
@@ -784,8 +780,10 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
         'YOUR INVESTIGATION PLAN:\n{plan_text}\n\n'
         '{action_schema}\n\n'
         'Output ONLY the JSON action object.\n'
-        'Include "purpose", "vision_prompt" (2-4 sentences for vision model),\n'
-        'and for count actions, "target_refinement" (1-2 sentences).\n\n'
+        'Include "purpose" and "prompt" for visual actions,\n'
+        'and "target_refinement" for count actions.\n\n'
+        'Your "prompt" will be sent directly to the vision model along with the\n'
+        'captured image or video. Write it to elicit the observation you need.\n\n'
         'If you already have enough evidence, use the answer action instead.'
     )
     md.append("```\n")
@@ -795,11 +793,10 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     md.append("## Step 4: Screenshot Interpret (Molmo2, image + text)\n")
     md.append("```")
     md.append(
-        '{vision_prompt from action JSON}\n\n---\n\n'
+        '{prompt from action JSON}\n\n---\n\n'
         f'Question: "{question}"\n\n'
         'This is a {{layout}} view at position (x, y, z), zoom={{zoom}}.\n'
-        f'{volume_info.format_for_prompt()}\n\n'
-        'Describe what you see. Report structures, counts, distribution.'
+        f'{volume_info.format_for_prompt()}'
     )
     md.append("```\n")
 
@@ -807,10 +804,9 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     md.append("## Step 4: Scan Interpret (Molmo2, video + text)\n")
     md.append("```")
     md.append(
-        '{vision_prompt from action JSON}\n\n---\n\n'
+        '{prompt from action JSON}\n\n---\n\n'
         f'Question: "{question}"\n\n'
-        'Scan: {{num_frames}} frames along {{axis}}, ~{{spacing}}\u00b5m between frames.\n'
-        'Describe what you observe across the frames.'
+        'Scan: {{num_frames}} frames along {{axis}}, ~{{spacing}}\u00b5m between frames.'
     )
     md.append("```\n")
 
@@ -829,17 +825,9 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     md.append(
         f'QUESTION: "{question}"\n\n'
         'INVESTIGATION COMPLETE \u2014 ALL FINDINGS:\n{findings_text}\n\n'
-        'You have reached the maximum number of iterations.\n'
         'Synthesize ALL findings into a comprehensive answer.\n'
-        'Be specific: include counts, spatial descriptions, and confidence level.'
+        'Be specific and cite evidence from your observations.'
     )
-    md.append("```\n")
-
-    # Zoom table
-    md.append("---\n")
-    md.append("## Appendix: Zoom Options\n")
-    md.append("```")
-    md.append(format_zoom_table())
     md.append("```\n")
 
     out_path = RESULTS_DIR / "prompts.md"

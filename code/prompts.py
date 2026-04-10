@@ -30,15 +30,18 @@ You must respond with exactly one JSON object. Available actions:
              "zoom": "full"}},
     "prompt": "<what specifically to look for in this view>"}}
 
-2. scan — sweep through the data as a video and DESCRIBE what you see (qualitative)
+2. scan — sweep through the volume as a video along one axis.
+   Produces a continuous sequence of frames that reveals the 3D
+   structure of the data — how features appear, persist, and change
+   through depth. Screenshots show single isolated slices; only a
+   scan shows the volume as a coherent whole.
    {{"action": "scan", "scan_type": "z_sweep",
     "start": {{"x": {cx:.0f}, "y": {cy:.0f}, "z": 0}},
     "end":   {{"x": {cx:.0f}, "y": {cy:.0f}, "z": {zmax:.0f}}},
     "frames": {max_scan_frames}, "layout": "xy", "zoom": "full",
     "prompt": "<what specifically to look for across this sweep>"}}
    scan_type options: z_sweep, x_pan, y_pan
-   scan is for QUALITATIVE description — understanding structure, distribution, and context.
-   Do NOT use scan to produce numerical counts; use count for that.
+   scan is for qualitative description. Use count for numerical results.
 
 3. count — DETECT + COUNT specific objects via automated pointing on sampled keyframes
    {{"action": "count", "scan_type": "z_sweep",
@@ -63,16 +66,12 @@ You must respond with exactly one JSON object. Available actions:
     "answer": "<your specific answer to the question>"}}
 
 LAYOUT: "xy", "xz", "yz", "4panel"
-NOTE: Do NOT use "3d" layout — it renders only a wireframe bounding box for raw image data, not the actual voxel data.
 
 OPTIONAL KEYS (for screenshot, scan, and count):
   "show": [1, 2]  — which layers to show (by number from the Layers list above). Omit to keep current visibility.
   "shaderRange": [vmin, vmax]  — adjust brightness/contrast for image layers
 
 IMPORTANT: Zooms below "full" CROP the view — you will miss data outside the visible area.
-
-PROMPT: Write a specific "prompt" for each screenshot/scan describing what you want to learn.
-Do NOT copy the placeholder — write a prompt specific to your current goal and question.
 
 {format_zoom_table()}
 """
@@ -127,8 +126,7 @@ def format_structured_findings(history: list[dict]) -> str:
 
 
 def build_plan_prompt(question, volume_info, first_look_finding, findings_text,
-                      iteration, max_iter, last_finding=None, last_fov=None,
-                      min_iter=3):
+                      iteration, last_finding=None, last_fov=None):
     """Step 1: OLMo reason over last finding + plan next action.
 
     Iteration 1: plan only (no prior finding to reason over).
@@ -140,13 +138,7 @@ def build_plan_prompt(question, volume_info, first_look_finding, findings_text,
             f"\"{first_look_finding}\"\n\n"
             f"QUESTION: \"{question}\"\n\n"
             f"VOLUME:\n{volume_info.format_for_prompt()}\n\n"
-            f"Plan your investigation strategy. What should you look at first, and why?\n\n"
-            f"Consider:\n"
-            f"- What spatial regions need examination to answer the question?\n"
-            f"- Would a different layout (xy vs xz vs yz) reveal different information?\n"
-            f"- Would a scan (video sweep) show spatial distribution better than a static view?\n"
-            f"- Would toggling layer visibility reveal alignment, segmentation quality, etc.?\n"
-            f"- Is the question quantitative (need count action) or qualitative (scan/screenshot)?"
+            f"Plan your investigation strategy. What should you look at first, and why?"
         )
 
     # Iteration 2+: reason about last finding, then plan
@@ -157,32 +149,13 @@ def build_plan_prompt(question, volume_info, first_look_finding, findings_text,
             finding_block += f"{last_fov}\n"
         finding_block += "\n"
 
-    min_answer_iter = min(min_iter, max_iter)
-    if iteration < min_answer_iter:
-        answer_block = (
-            f"You are on iteration {iteration}/{max_iter} — it is TOO EARLY to answer.\n"
-            f"You need to examine more views and orientations first.\n"
-        )
-    else:
-        answer_block = (
-            f"ONLY if you have examined multiple views/orientations and have enough\n"
-            f"evidence to give a final answer, respond instead with:\n"
-            f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}\n'
-        )
-
     return (
         f"QUESTION: \"{question}\"\n\n"
         f"{finding_block}"
         f"INVESTIGATION SO FAR:\n\n{findings_text}\n\n"
-        f"Iteration {iteration}/{max_iter}.\n\n"
-        f"PART 1 — REASONING: Analyze the latest finding in context:\n"
-        f"- Does it confirm, contradict, or extend previous findings?\n"
-        f"- What spatial regions remain unexplored?\n"
-        f"- Do you have sufficient evidence to answer the question?\n\n"
-        f"PART 2 — PLAN: Based on your reasoning, what should you investigate next?\n"
-        f"Consider what spatial regions remain unexplored, whether findings are\n"
-        f"consistent, and whether you have enough evidence to answer.\n\n"
-        f"{answer_block}"
+        f"Analyze the latest finding in context, then decide what to investigate next.\n\n"
+        f"If you have enough evidence to answer the question confidently, respond with:\n"
+        f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}'
     )
 
 
@@ -192,15 +165,11 @@ def build_action_prompt(plan_text, volume_info, config):
     return (
         f"YOUR INVESTIGATION PLAN:\n{plan_text}\n\n"
         f"{schema}\n\n"
-        f"Output ONLY the JSON action object that executes your plan — no other text.\n"
-        f"Include a \"purpose\" field explaining what you expect to learn.\n\n"
-        f"VISION PROMPT: For screenshot, scan, and count actions, include a\n"
-        f"\"vision_prompt\" field (2-4 sentences) telling the vision model:\n"
-        f"- What specific features or structures to focus on\n"
-        f"- What to compare against prior findings (if any)\n"
-        f"- Any artifacts or confounds to watch for\n"
-        f"For count actions, include a \"target_refinement\" field (1-2 sentences)\n"
-        f"to help the vision model identify the right objects.\n\n"
+        f"Output ONLY the JSON action object.\n"
+        f"Include \"purpose\" and \"prompt\" for visual actions,\n"
+        f"and \"target_refinement\" for count actions.\n\n"
+        f"Your \"prompt\" will be sent directly to the vision model along with the\n"
+        f"captured image or video. Write it to elicit the observation you need.\n\n"
         f"If you already have enough evidence, use the answer action instead."
     )
 
@@ -218,12 +187,7 @@ def build_molmo_screenshot_prompt(olmo_instructions, question, action, volume_in
         f"{olmo_instructions}\n\n---\n\n"
         f"Question: \"{question}\"\n\n"
         f"This is a {layout} view at position ({x:.0f}, {y:.0f}, {z:.0f}), zoom={zoom}.\n"
-        f"{volume_info.format_for_prompt()}\n\n"
-        f"Describe what you see. Report:\n"
-        f"- What structures are present (type, shape, intensity)\n"
-        f"- Approximate counts if objects are discrete and countable\n"
-        f"- Spatial distribution (clustered, uniform, sparse/dense regions)\n"
-        f"- Anything unusual or noteworthy"
+        f"{volume_info.format_for_prompt()}"
     )
 
 
@@ -241,12 +205,7 @@ def build_molmo_scan_prompt(olmo_instructions, question, action, volume_info,
         f"({start.get('x',0):.0f},{start.get('y',0):.0f},{start.get('z',0):.0f}) \u2192 "
         f"({end.get('x',0):.0f},{end.get('y',0):.0f},{end.get('z',0):.0f})\n"
         f"Frame spacing: ~{frame_spacing:.1f}\u00b5m, total distance: {total_dist:.0f}\u00b5m\n"
-        f"Layout: {layout}, zoom: {zoom}\n\n"
-        f"Describe what you observe across the frames:\n"
-        f"- How does the content change along the scan axis?\n"
-        f"- Where are structures most dense vs sparse?\n"
-        f"- Are there boundaries, transitions, or abrupt changes?\n"
-        f"- Estimate the spatial extent of notable features"
+        f"Layout: {layout}, zoom: {zoom}"
     )
 
 
