@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
-# run.sh — Entry point for molmo-glancer agent pipeline.
-# Sets environment, runs molmo_glancer.py, tees output to log.
+set -ex
 
-set -euo pipefail
+# This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
+bash run_all_presets.sh "$@"
 
-export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/scratch/ms-playwright}"
-export HF_HOME="${HF_HOME:-/scratch/huggingface}"
-export NEUROGLANCER_BASE="${NEUROGLANCER_BASE:-https://neuroglancer-demo.appspot.com}"
-
-RESULTS_DIR="${RESULTS_DIR:-/results}"
-mkdir -p "$RESULTS_DIR"
-
-echo "=== molmo-glancer ==="
-echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
-echo "  VRAM: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
-echo "  Start: $(date -Iseconds)"
-echo ""
-
-python3 -u /code/molmo_glancer.py "$@" 2>&1 | tee "$RESULTS_DIR/output.log"
+# The previous version of this file was commented-out and follows below:
+#
+# #!/usr/bin/env bash
+# # run.sh — Entry point for molmo-glancer agent pipeline.
+# # Sets environment, runs molmo_glancer.py, tees output to log.
+# 
+# set -euo pipefail
+# 
+# export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/scratch/ms-playwright}"
+# export HF_HOME="${HF_HOME:-/scratch/huggingface}"
+# export NEUROGLANCER_BASE="${NEUROGLANCER_BASE:-https://neuroglancer-demo.appspot.com}"
+# 
+# RESULTS_DIR="${RESULTS_DIR:-/results}"
+# mkdir -p "$RESULTS_DIR"
+# 
+# echo "=== molmo-glancer ==="
+# echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
+# echo "  VRAM: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
+# echo "  Start: $(date -Iseconds)"
+# echo ""
+# 
+# python3 -u /code/molmo_glancer.py "$@" 2>&1 | tee "$RESULTS_DIR/output.log"
+# 
