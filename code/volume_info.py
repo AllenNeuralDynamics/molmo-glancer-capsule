@@ -135,15 +135,9 @@ class VolumeInfo:
         lines.append(f"Center: x={cx:.1f}, y={cy:.1f}, z={cz:.1f}")
         lines.append(f"Ranges: x=[0..{s[0]:.0f}], y=[0..{s[1]:.0f}], z=[0..{s[2]:.0f}]")
 
-        # Pixel size context at full zoom
+        # Pixel scale at full zoom
         um_per_pixel = max(s[0], s[1]) / VIEWPORT_SIZE
-        neuron_um = 30.0
-        neuron_pixels = neuron_um / um_per_pixel
-        lines.append(
-            f"A neuron is ~{neuron_um:.0f}{units} across "
-            f"(~{neuron_pixels:.0f}px at full zoom). "
-            f"{'Objects this small need zoomed-in views for reliable detection.' if neuron_pixels < 40 else 'Visible at full zoom.'}"
-        )
+        lines.append(f"Pixel scale at full zoom: ~{um_per_pixel:.2f} {units}/px")
         return "\n  ".join(lines)
 
 

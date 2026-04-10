@@ -856,19 +856,28 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
     transcript_path = RESULTS_DIR / "transcript.md"
     transcript_path.write_text("# molmo-glancer — Transcript\n\n")
 
-    def log_exchange(iteration, step, prompt, response, tokens=None, note=None):
+    def log_exchange(iteration, step, prompt, response, tokens=None,
+                     note=None, elapsed=None):
         """Append a prompt/response pair to the transcript file."""
+        def _blockquote(text):
+            return "\n".join(f"> {line}" for line in str(text).split("\n"))
+
         with open(transcript_path, "a") as f:
             f.write(f"---\n\n## Iteration {iteration} — {step}\n\n")
             if note:
                 f.write(f"_{note}_\n\n")
+            meta_parts = []
             if tokens:
                 tok_str = f"{tokens['input_tokens']} in / {tokens['output_tokens']} out"
                 if "think_tokens" in tokens:
                     tok_str += f" ({tokens['think_tokens']} think)"
-                f.write(f"**Tokens:** {tok_str}\n\n")
-            f.write(f"### Prompt\n\n```\n{prompt}\n```\n\n")
-            f.write(f"### Response\n\n```\n{response}\n```\n\n")
+                meta_parts.append(f"Tokens: {tok_str}")
+            if elapsed is not None:
+                meta_parts.append(f"Time: {elapsed:.1f}s")
+            if meta_parts:
+                f.write(f"**{' | '.join(meta_parts)}**\n\n")
+            f.write(f"### Prompt\n\n{_blockquote(prompt)}\n\n")
+            f.write(f"### Response\n\n{_blockquote(response)}\n\n")
 
     # ── Parse NG state and discover volume ──────────────────────────
     print("\n[Setup] Parsing NG link and discovering volume metadata ...")
@@ -888,14 +897,17 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
         },
     }
 
-    def track(iteration, step, tokens, model_name="molmo"):
+    def track(iteration, step, tokens, model_name="molmo", elapsed=None):
         entry = {"iteration": iteration, "step": step, "model": model_name, **tokens}
+        if elapsed is not None:
+            entry["elapsed_s"] = round(elapsed, 1)
         token_usage["iterations"].append(entry)
         token_usage["totals"]["input_tokens"] += tokens["input_tokens"]
         token_usage["totals"]["output_tokens"] += tokens["output_tokens"]
         token_usage["by_model"][model_name]["input_tokens"] += tokens["input_tokens"]
         token_usage["by_model"][model_name]["output_tokens"] += tokens["output_tokens"]
-        print(f"    [{model_name}] {tokens['input_tokens']} in / {tokens['output_tokens']} out")
+        t_str = f" ({elapsed:.1f}s)" if elapsed is not None else ""
+        print(f"    [{model_name}] {tokens['input_tokens']} in / {tokens['output_tokens']} out{t_str}")
 
     # ── Agent loop state ────────────────────────────────────────────────
     history = []          # list of {iteration, action_data, finding, fov_feedback}
@@ -932,13 +944,15 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             f"Describe what you see: what kind of data, what structures are visible, "
             f"how dense or sparse is the content?"
         )
+        t0 = time.time()
         first_look_finding, tokens = ask_vision(
             manager.molmo_model, manager.molmo_processor,
             first_look_img, first_look_prompt, max_new_tokens=512,
         )
-        track(0, "first_look", tokens, "molmo")
+        elapsed = time.time() - t0
+        track(0, "first_look", tokens, "molmo", elapsed)
         log_exchange(0, "first_look", first_look_prompt, first_look_finding,
-                     tokens, "image: view_001.png")
+                     tokens, "image: view_001.png", elapsed)
         print(f"  First look: {first_look_finding[:300]}...")
 
         history.append({
@@ -969,25 +983,31 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 question, volume_info, first_look_finding, findings_text,
                 iteration, max_iter,
             )
+            t0 = time.time()
             plan_text, tokens, _ = ask_text_olmo(
                 manager, OLMO_SYSTEM_PROMPT, plan_prompt,
                 max_new_tokens=config["olmo_max_new_tokens_plan"],
                 sampling=config["olmo_sampling_structured"],
             )
-            track(iteration, "plan", tokens, "olmo")
-            log_exchange(iteration, "step1_plan", plan_prompt, plan_text, tokens)
+            elapsed = time.time() - t0
+            track(iteration, "plan", tokens, "olmo", elapsed)
+            log_exchange(iteration, "step1_plan", plan_prompt, plan_text,
+                         tokens, elapsed=elapsed)
             print(f"  Plan: {plan_text[:300]}...")
 
             # ── Step 2: OLMo action decision (strict JSON) ──────────
             print("\n  [Step 2] OLMo: Action decision ...")
             action_prompt = build_action_prompt(plan_text, volume_info, config)
+            t0 = time.time()
             action_text, tokens, _ = ask_text_olmo(
                 manager, OLMO_SYSTEM_PROMPT, action_prompt,
                 max_new_tokens=config["olmo_max_new_tokens_decision"],
                 sampling=config["olmo_sampling_structured"],
             )
-            track(iteration, "action", tokens, "olmo")
-            log_exchange(iteration, "step2_action", action_prompt, action_text, tokens)
+            elapsed = time.time() - t0
+            track(iteration, "action", tokens, "olmo", elapsed)
+            log_exchange(iteration, "step2_action", action_prompt, action_text,
+                         tokens, elapsed=elapsed)
             print(f"  Action text: {action_text[:200]}...")
 
             # Parse JSON action
@@ -999,13 +1019,16 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     + "\n\nYour previous response was not valid JSON. "
                     "Please respond with ONLY a JSON object."
                 )
+                t0 = time.time()
                 action_text, tokens, _ = ask_text_olmo(
                     manager, OLMO_SYSTEM_PROMPT, retry_prompt,
                     max_new_tokens=config["olmo_max_new_tokens_retry"],
                     sampling=config["olmo_sampling_retry"],
                 )
-                track(iteration, "action_retry", tokens, "olmo")
-                log_exchange(iteration, "step2_retry", retry_prompt, action_text, tokens)
+                elapsed = time.time() - t0
+                track(iteration, "action_retry", tokens, "olmo", elapsed)
+                log_exchange(iteration, "step2_retry", retry_prompt, action_text,
+                             tokens, elapsed=elapsed)
                 action = parse_action(action_text)
 
             if action is None:
@@ -1038,14 +1061,16 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 reason_prompt = build_reason_shortcircuit_prompt(
                     question, reason_q, findings_text,
                 )
+                t0 = time.time()
                 finding, tokens, _ = ask_text_olmo(
                     manager, OLMO_SYSTEM_PROMPT, reason_prompt,
                     max_new_tokens=config["olmo_max_new_tokens_reasoning"],
                     sampling=config["olmo_sampling_structured"],
                 )
-                track(iteration, "reason_shortcircuit", tokens, "olmo")
+                elapsed = time.time() - t0
+                track(iteration, "reason_shortcircuit", tokens, "olmo", elapsed)
                 log_exchange(iteration, "reason_shortcircuit", reason_prompt,
-                             finding, tokens)
+                             finding, tokens, elapsed=elapsed)
                 print(f"  Reasoning: {finding[:200]}...")
 
                 # Check if OLMo decided to answer within reasoning
@@ -1084,13 +1109,16 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     f"What should you do DIFFERENTLY, or do you have enough "
                     f"evidence to answer?"
                 )
+                t0 = time.time()
                 finding, tokens, _ = ask_text_olmo(
                     manager, OLMO_SYSTEM_PROMPT, dup_prompt,
                     max_new_tokens=config["olmo_max_new_tokens_reasoning"],
                     sampling=config["olmo_sampling_structured"],
                 )
-                track(iteration, "forced_reason", tokens, "olmo")
-                log_exchange(iteration, "forced_reason", dup_prompt, finding, tokens)
+                elapsed = time.time() - t0
+                track(iteration, "forced_reason", tokens, "olmo", elapsed)
+                log_exchange(iteration, "forced_reason", dup_prompt, finding,
+                             tokens, elapsed=elapsed)
                 print(f"  Forced reasoning: {finding[:200]}...")
 
                 history.append({
@@ -1109,14 +1137,16 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             instr_prompt = build_vision_instructions_prompt(
                 action, question, findings_text,
             )
+            t0 = time.time()
             olmo_instructions, tokens, _ = ask_text_olmo(
                 manager, OLMO_SYSTEM_PROMPT, instr_prompt,
                 max_new_tokens=config["olmo_max_new_tokens_vision_instr"],
                 sampling=config["olmo_sampling_structured"],
             )
-            track(iteration, "vision_instructions", tokens, "olmo")
+            elapsed = time.time() - t0
+            track(iteration, "vision_instructions", tokens, "olmo", elapsed)
             log_exchange(iteration, "step3_vision_instr", instr_prompt,
-                         olmo_instructions, tokens)
+                         olmo_instructions, tokens, elapsed=elapsed)
             print(f"  Instructions: {olmo_instructions[:200]}...")
 
             # ── Steps 4-5: Molmo2 capture + interpret ────────────────
@@ -1136,14 +1166,16 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     olmo_instructions, question, action, volume_info,
                 )
                 print(f"  [Step 5] Molmo2: Interpreting screenshot ...")
+                t0 = time.time()
                 finding, tokens = ask_vision(
                     manager.molmo_model, manager.molmo_processor,
                     img, interpret_prompt, max_new_tokens=1024,
                 )
-                track(iteration, "interpret_screenshot", tokens, "molmo")
+                elapsed = time.time() - t0
+                track(iteration, "interpret_screenshot", tokens, "molmo", elapsed)
                 log_exchange(iteration, "step5_interpret", interpret_prompt,
                              finding, tokens,
-                             f"image: view_{screenshot_count:03d}.png")
+                             f"image: view_{screenshot_count:03d}.png", elapsed)
                 print(f"  Finding: {finding[:200]}...")
 
                 # FOV feedback
@@ -1185,16 +1217,18 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 )
                 print(f"  [Step 5] Molmo2: Interpreting scan "
                       f"({len(frames)} frames) ...")
+                t0 = time.time()
                 finding, tokens = ask_scan(
                     manager.molmo_model, manager.molmo_processor,
                     frames, interpret_prompt,
                     max_new_tokens=1024, config=config,
                 )
-                track(iteration, "interpret_scan", tokens, "molmo")
+                elapsed = time.time() - t0
+                track(iteration, "interpret_scan", tokens, "molmo", elapsed)
                 log_exchange(iteration, "step5_interpret_scan", interpret_prompt,
                              finding, tokens,
                              f"video: scan_{scan_count:03d}.mp4, "
-                             f"{len(frames)} frames")
+                             f"{len(frames)} frames", elapsed)
                 print(f"  Finding: {finding[:200]}...")
 
             elif action_type == "count":
@@ -1229,6 +1263,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 points = []
                 total_point_tokens = {"input_tokens": 0, "output_tokens": 0}
 
+                t0 = time.time()
                 for ki in keyframe_indices:
                     _, frame_points, tokens = ask_vision_pointing(
                         manager.molmo_model, manager.molmo_processor,
@@ -1239,8 +1274,10 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     for x, y in frame_points:
                         points.append((float(ki), x, y))
                     print(f"    keyframe {ki}: {len(frame_points)} points")
+                elapsed = time.time() - t0
 
-                track(iteration, "count_point", total_point_tokens, "molmo")
+                track(iteration, "count_point", total_point_tokens, "molmo",
+                      elapsed)
                 pointing_summary = "\n".join(
                     f"  keyframe {ki}: "
                     f"{sum(1 for p in points if int(p[0]) == ki)} points"
@@ -1249,7 +1286,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 log_exchange(iteration, "count_point", point_prompt,
                              pointing_summary, total_point_tokens,
                              f"video: scan_{scan_count:03d}.mp4, "
-                             f"{len(keyframe_indices)} keyframes")
+                             f"{len(keyframe_indices)} keyframes", elapsed)
                 print(f"  Pointing total: {len(points)} points")
 
                 if points:
@@ -1337,14 +1374,16 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     fov_feedback=fov_feedback,
                 )
 
+            t0 = time.time()
             reasoning_text, tokens, _ = ask_text_olmo(
                 manager, OLMO_SYSTEM_PROMPT, reasoning_prompt,
                 max_new_tokens=config["olmo_max_new_tokens_reasoning"],
                 sampling=config["olmo_sampling_structured"],
             )
-            track(iteration, "reasoning", tokens, "olmo")
+            elapsed = time.time() - t0
+            track(iteration, "reasoning", tokens, "olmo", elapsed)
             log_exchange(iteration, "step6_reasoning", reasoning_prompt,
-                         reasoning_text, tokens)
+                         reasoning_text, tokens, elapsed=elapsed)
             print(f"  Reasoning: {reasoning_text[:200]}...")
 
             # Append OLMo interpretation to count findings
@@ -1388,14 +1427,16 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             f"Be specific: include counts, spatial descriptions, "
             f"and confidence level."
         )
+        t0 = time.time()
         answer_text, tokens, _ = ask_text_olmo(
             manager, OLMO_SYSTEM_PROMPT, synth_prompt,
             max_new_tokens=config["olmo_max_new_tokens_synthesis"],
             sampling=config["olmo_sampling_synthesis"],
         )
-        track(max_iter, "forced_answer", tokens, "olmo")
+        elapsed = time.time() - t0
+        track(max_iter, "forced_answer", tokens, "olmo", elapsed)
         log_exchange(max_iter, "forced_answer", synth_prompt,
-                     answer_text, tokens)
+                     answer_text, tokens, elapsed=elapsed)
 
         forced_action = parse_action(answer_text)
         if forced_action and "answer" in forced_action:
