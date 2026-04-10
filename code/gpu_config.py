@@ -27,14 +27,14 @@ CONFIG = {
     "max_context_tokens": 55000,
     # OLMo 3.1 32B Think (text reasoning)
     "max_olmo_context_tokens": 32000,
-    # OLMo generation budgets (deep-dive §7.1)
-    "olmo_max_new_tokens_plan": 4096,
-    "olmo_max_new_tokens_decision": 4096,
-    "olmo_max_new_tokens_vision_instr": 2048,
-    "olmo_max_new_tokens_reasoning": 6144,
-    "olmo_max_new_tokens_synthesis": 8192,
-    "olmo_max_new_tokens_retry": 2048,
-    "olmo_max_new_tokens_hard_cap": 16384,
+    # OLMo generation budgets — aggressive debug values (restore for prod)
+    "olmo_max_new_tokens_plan": 512,
+    "olmo_max_new_tokens_decision": 512,
+    "olmo_max_new_tokens_vision_instr": 256,
+    "olmo_max_new_tokens_reasoning": 1024,
+    "olmo_max_new_tokens_synthesis": 1536,
+    "olmo_max_new_tokens_retry": 256,
+    "olmo_max_new_tokens_hard_cap": 2048,
     # OLMo sampling presets (deep-dive §16.2)
     "olmo_sampling_structured": {
         "temperature": 0.2, "top_p": 0.9,
@@ -49,7 +49,7 @@ CONFIG = {
         "repetition_penalty": 1.1, "do_sample": True,
     },
     # Agent loop
-    "max_agent_iterations": 20,
+    "max_agent_iterations": 3,  # debug — restore to 20 for prod
 }
 
 MIN_VRAM_GB = 40

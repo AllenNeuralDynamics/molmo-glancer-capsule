@@ -115,20 +115,23 @@ Your job is to:
 2. Reason about findings — resolve contradictions, identify gaps, estimate quantities
 3. Decide when you have enough evidence to answer confidently
 
-Think carefully before acting. Consider:
-- What spatial regions remain unexplored?
-- Are findings consistent across views? If not, why?
-- What view would most efficiently resolve remaining uncertainty?
-- Are quantitative estimates grounded in actual detections, or guesses?"""
+Keep your thinking brief and focused. Do not speculate at length — state your
+reasoning in 2-3 sentences, then give your answer or next action directly.
+Avoid restating the question or rehashing prior findings unnecessarily."""
 
 
 def strip_think_tokens(text: str) -> tuple[str, str, bool]:
     """Extract and separate think blocks from OLMo output.
 
+    Handles three cases:
+      1. Matched <think>...</think> blocks
+      2. Bare </think> without opening tag (model omits <think>)
+      3. Unclosed <think> (model ran out of tokens mid-thought)
+
     Parameters
     ----------
     text : str
-        Raw OLMo output potentially containing <think>...</think> blocks.
+        Raw OLMo output potentially containing think blocks.
 
     Returns
     -------
@@ -137,18 +140,25 @@ def strip_think_tokens(text: str) -> tuple[str, str, bool]:
     think_content : str
         Concatenated content of all think blocks.
     was_truncated : bool
-        True if a <think> block was never closed (model ran out of tokens
-        before producing its actual response).
+        True if a think block was never closed.
     """
     open_count = text.count("<think>")
     close_count = text.count("</think>")
+
+    # Case 2: bare </think> without <think> — everything before it is thinking
+    if close_count > 0 and open_count == 0:
+        idx = text.index("</think>")
+        think_content = text[:idx].strip()
+        clean = text[idx + len("</think>"):].strip()
+        return clean, think_content, False
+
     was_truncated = open_count > close_count
 
-    # Extract closed blocks
+    # Case 1: matched <think>...</think> blocks
     think_blocks = re.findall(r'<think>(.*?)</think>', text, re.DOTALL)
     clean = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
 
-    # If truncated, also strip the unclosed trailing block
+    # Case 3: unclosed trailing <think> block
     if was_truncated:
         clean = re.sub(r'<think>(?!.*</think>).*$', '', clean, flags=re.DOTALL)
 
