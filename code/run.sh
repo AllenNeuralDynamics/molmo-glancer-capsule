@@ -22,7 +22,5 @@ echo "  VRAM: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev
 echo "  Start: $(date -Iseconds)"
 echo ""
 
-bash run_all_presets.sh "$@"
-
-# python3 -u /code/molmo_glancer.py "$@" 2>&1 | tee "$RESULTS_DIR/output.log"
-
+# bash run_all_presets.sh "$@"
+python3 -u /code/molmo_glancer.py "$@" 2>&1 | tee "$RESULTS_DIR/output.log"

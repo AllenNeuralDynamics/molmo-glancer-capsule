@@ -49,7 +49,7 @@ CONFIG = {
         "repetition_penalty": 1.1, "do_sample": True,
     },
     # Agent loop
-    "max_agent_iterations": 3,  # debug — restore to 20 for prod
+    "max_agent_iterations": 20
 }
 
 MIN_VRAM_GB = 40

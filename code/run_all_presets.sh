@@ -12,7 +12,7 @@
 set -euo pipefail
 
 rm -rf /results/*
-rm -rf /scratch/*
+# rm -rf /scratch/*
 
 PRESETS=(neurons alignment neurons_large alignment_loop segmentation)
 TOTAL_START=$(date +%s)
@@ -33,14 +33,14 @@ echo ""
 echo "════════════════════════════════════════════════════════"
 echo "  Phase 1/4: Dev startup"
 echo "════════════════════════════════════════════════════════"
-bash /code/_dev_startup.sh
+# bash /code/_dev_startup.sh
 
 # ── Phase 2: Download weights ────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════"
 echo "  Phase 2/4: Download weights"
 echo "════════════════════════════════════════════════════════"
-bash /code/_download_weights.sh
+# bash /code/_download_weights.sh
 
 # ── Phase 3: Run each preset ────────────────────────────────
 echo ""
@@ -61,9 +61,10 @@ for i in "${!PRESETS[@]}"; do
 
     # Clear results from previous run
     bash /code/cleanup.sh
+    RESULTS_DIR="${RESULTS_DIR:-/results}"
 
     # Run the preset — continue on failure
-    if bash /code/run.sh --preset "$preset"; then
+    if python3 -u /code/molmo_glancer.py --preset "$preset" 2>&1 | tee "$RESULTS_DIR/output.log"; then
         STATUSES[$i]="PASS"
     else
         STATUSES[$i]="FAIL"
