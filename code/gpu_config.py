@@ -28,14 +28,17 @@ CONFIG = {
     "max_context_tokens": 55000,
     # OLMo 3.1 32B Think (text reasoning)
     "max_olmo_context_tokens": 32000,
-    # OLMo generation budgets — moderate debug (model needs room to think + answer)
-    "olmo_max_new_tokens_plan": 1536,
-    "olmo_max_new_tokens_decision": 1024,
-    "olmo_max_new_tokens_vision_instr": 768,
-    "olmo_max_new_tokens_reasoning": 2048,
-    "olmo_max_new_tokens_synthesis": 2048,
-    "olmo_max_new_tokens_retry": 768,
-    "olmo_max_new_tokens_hard_cap": 4096,
+    # OLMo generation budgets — let it cook (think + answer share budget)
+    # Step 1 (reason + plan, think=True): generous for deep reasoning
+    "olmo_max_new_tokens_plan": 18000,
+    # Step 2 (action JSON + vision prompt, think=False): structured output
+    "olmo_max_new_tokens_decision": 8192,
+    # Synthesis / forced answer (think=True): final comprehensive answer
+    "olmo_max_new_tokens_synthesis": 18000,
+    # Retry on JSON parse failure (think=False)
+    "olmo_max_new_tokens_retry": 8192,
+    # Hard cap for any single call
+    "olmo_max_new_tokens_hard_cap": 18000,
     # OLMo sampling — per HF model card: temp=0.6, top_p=0.95
     "olmo_sampling_structured": {
         "temperature": 0.6, "top_p": 0.95,

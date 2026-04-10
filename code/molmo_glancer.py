@@ -213,8 +213,19 @@ def ask_text_olmo(manager, system_prompt: str, user_prompt: str,
 
     clean_text, think_content, was_truncated = strip_think_tokens(raw_text)
 
+    # Detect invisible truncation: skip_special_tokens strips <think>, so when
+    # the model hits max_new_tokens mid-thought (no </think> generated),
+    # strip_think_tokens sees no markers and returns think content as "clean".
+    if (think and not was_truncated and not think_content
+            and len(generated) >= max_new_tokens
+            and "</think>" not in raw_text):
+        was_truncated = True
+        think_content = clean_text
+        clean_text = ""
+
     if was_truncated:
-        print(f"  WARNING: OLMo think block truncated at {max_new_tokens} tokens")
+        print(f"  WARNING: OLMo think block truncated at {max_new_tokens} tokens"
+              f" — no usable response generated")
 
     think_tok_count = (
         sum(len(tokenizer.encode(b)) for b in think_content.split('\n'))
@@ -225,6 +236,7 @@ def ask_text_olmo(manager, system_prompt: str, user_prompt: str,
         "output_tokens": len(generated),
         "think_tokens": think_tok_count,
         "think_content": think_content if think_content else "",
+        "was_truncated": was_truncated,
     }
 
     return clean_text, token_counts, raw_text
@@ -686,8 +698,13 @@ def format_structured_findings(history: list[dict]) -> str:
 # ── v4 Prompt Builders (6-step iteration) ──────────────────────────────────
 
 def build_plan_prompt(question, volume_info, first_look_finding, findings_text,
-                      iteration, max_iter):
-    """Step 1: OLMo investigation plan (natural language)."""
+                      iteration, max_iter, last_finding=None, last_fov=None,
+                      min_iter=3):
+    """Step 1: OLMo reason over last finding + plan next action.
+
+    Iteration 1: plan only (no prior finding to reason over).
+    Iteration 2+: reason about last finding, then plan next step.
+    """
     if iteration == 1:
         return (
             f"You have examined a 3D volume and received this initial description:\n"
@@ -702,59 +719,60 @@ def build_plan_prompt(question, volume_info, first_look_finding, findings_text,
             f"- Would toggling layer visibility reveal alignment, segmentation quality, etc.?\n"
             f"- Is the question quantitative (need count action) or qualitative (scan/screenshot)?"
         )
+
+    # Iteration 2+: reason about last finding, then plan
+    finding_block = ""
+    if last_finding:
+        finding_block = f"LATEST FINDING (iteration {iteration - 1}):\n{last_finding}\n"
+        if last_fov:
+            finding_block += f"{last_fov}\n"
+        finding_block += "\n"
+
+    min_answer_iter = min(min_iter, max_iter)
+    if iteration < min_answer_iter:
+        answer_block = (
+            f"You are on iteration {iteration}/{max_iter} — it is TOO EARLY to answer.\n"
+            f"You need to examine more views and orientations first.\n"
+        )
+    else:
+        answer_block = (
+            f"ONLY if you have examined multiple views/orientations and have enough\n"
+            f"evidence to give a final answer, respond instead with:\n"
+            f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}\n'
+        )
+
     return (
         f"QUESTION: \"{question}\"\n\n"
+        f"{finding_block}"
         f"INVESTIGATION SO FAR:\n\n{findings_text}\n\n"
-        f"Iteration {iteration}/{max_iter}. What should you investigate next, and why?\n\n"
+        f"Iteration {iteration}/{max_iter}.\n\n"
+        f"PART 1 — REASONING: Analyze the latest finding in context:\n"
+        f"- Does it confirm, contradict, or extend previous findings?\n"
+        f"- What spatial regions remain unexplored?\n"
+        f"- Do you have sufficient evidence to answer the question?\n\n"
+        f"PART 2 — PLAN: Based on your reasoning, what should you investigate next?\n"
         f"Consider what spatial regions remain unexplored, whether findings are\n"
-        f"consistent, and whether you have enough evidence to answer."
+        f"consistent, and whether you have enough evidence to answer.\n\n"
+        f"{answer_block}"
     )
 
 
 def build_action_prompt(plan_text, volume_info, config):
-    """Step 2: OLMo strict JSON action from schema."""
+    """Step 2: OLMo strict JSON action + vision prompt from schema."""
     schema = build_action_schema(volume_info, config["max_scan_frames"])
     return (
         f"YOUR INVESTIGATION PLAN:\n{plan_text}\n\n"
         f"{schema}\n\n"
         f"Output ONLY the JSON action object that executes your plan — no other text.\n"
         f"Include a \"purpose\" field explaining what you expect to learn.\n\n"
-        f"If you already have enough evidence, use the answer action instead."
-    )
-
-
-def build_vision_instructions_prompt(action, question, findings_text):
-    """Step 3: OLMo crafts instructions for Molmo2."""
-    action_type = action.get("action", "")
-    purpose = action.get("purpose", "")
-    action_summary = json.dumps(action, indent=2)[:500]
-
-    findings_lines = findings_text.strip().split("\n── ")
-    last_findings = "\n── ".join(findings_lines[-2:]) if len(findings_lines) >= 2 else findings_text[-500:]
-
-    if action_type == "count":
-        target = action.get("target", "objects")
-        return (
-            f"You have planned a count action:\n{action_summary}\n\n"
-            f"PURPOSE: {purpose}\nTARGET: \"{target}\"\n\n"
-            f"The vision model will be told: \"Point to each {target}.\"\n"
-            f"Refine the target description to help it identify the right objects:\n"
-            f"- What size and shape are the targets?\n"
-            f"- What intensity or color distinguishes them from background?\n"
-            f"- Should the model ignore any similar-looking artifacts?\n\n"
-            f"Output a short refinement (1-2 sentences) that will be appended after\n"
-            f"\"Point to each {target}.\" — do not repeat that prefix."
-        )
-    return (
-        f"You have planned this view:\n{action_summary}\n\n"
-        f"PURPOSE: {purpose}\nQUESTION: \"{question}\"\n\n"
-        f"RECENT FINDINGS:\n{last_findings}\n\n"
-        f"Write specific instructions for the vision model that will interpret this view.\n"
-        f"Tell it:\n- What specific features or structures to focus on\n"
-        f"- What region of the image matters most for this investigation\n"
+        f"VISION PROMPT: For screenshot, scan, and count actions, include a\n"
+        f"\"vision_prompt\" field (2-4 sentences) telling the vision model:\n"
+        f"- What specific features or structures to focus on\n"
         f"- What to compare against prior findings (if any)\n"
-        f"- Any artifacts or confounds to watch for\n\n"
-        f"Keep it concise (2-4 sentences)."
+        f"- Any artifacts or confounds to watch for\n"
+        f"For count actions, include a \"target_refinement\" field (1-2 sentences)\n"
+        f"to help the vision model identify the right objects.\n\n"
+        f"If you already have enough evidence, use the answer action instead."
     )
 
 
@@ -800,74 +818,8 @@ def build_molmo_scan_prompt(olmo_instructions, question, action, volume_info,
     )
 
 
-def build_reasoning_prompt(question, finding, findings_text, iteration,
-                           max_iter=20, min_iter=3, fov_feedback=""):
-    """Step 6: OLMo post-finding reasoning."""
-    finding_block = finding
-    if fov_feedback:
-        finding_block += f"\n{fov_feedback}"
-
-    # Don't offer the answer option until min_iter
-    min_answer_iter = min(min_iter, max_iter)
-    if iteration < min_answer_iter:
-        answer_block = (
-            f"You are on iteration {iteration}/{max_iter} — it is TOO EARLY to answer.\n"
-            f"You have only examined one view. Describe what you still need to investigate\n"
-            f"(different orientations, regions, zoom levels, layer toggling)."
-        )
-    else:
-        answer_block = (
-            f"ONLY if you have examined multiple views/orientations and have enough\n"
-            f"evidence to give a final answer, respond instead with:\n"
-            f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}'
-        )
-
-    return (
-        f"QUESTION: \"{question}\"\n\n"
-        f"NEW FINDING (iteration {iteration}):\n{finding_block}\n\n"
-        f"INVESTIGATION SO FAR:\n{findings_text}\n\n"
-        f"Analyze the new finding in context of your prior investigation:\n\n"
-        f"1. Does this finding confirm, contradict, or extend previous findings?\n"
-        f"2. What spatial regions remain unexplored?\n"
-        f"3. Do you have sufficient evidence to answer the question confidently?\n\n"
-        f"Respond in plain language (2-5 sentences). Summarize your current understanding\n"
-        f"and what remains uncertain.\n\n"
-        f"{answer_block}"
-    )
-
-
-def build_count_reasoning_prompt(question, target, pointing_stats, findings_text,
-                                 iteration, max_iter=20, min_iter=3):
-    """Step 6 count variant: OLMo interprets pointing statistics."""
-    min_answer_iter = min(min_iter, max_iter)
-    if iteration < min_answer_iter:
-        answer_block = (
-            f"You are on iteration {iteration}/{max_iter} — it is TOO EARLY to answer.\n"
-            f"Describe what additional counts or views you need to confirm the results."
-        )
-    else:
-        answer_block = (
-            f"ONLY if you have enough evidence to give a final answer, respond instead with:\n"
-            f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}'
-        )
-
-    return (
-        f"QUESTION: \"{question}\"\n\n"
-        f"COUNT RESULTS (iteration {iteration}):\nTarget: \"{target}\"\n"
-        f"{pointing_stats}\n\n"
-        f"INVESTIGATION SO FAR:\n{findings_text}\n\n"
-        f"Interpret these detection results:\n"
-        f"- Account for double-counting (objects spanning multiple z-slices)\n"
-        f"- Keyframe spacing vs object size: if spacing < diameter, expect overcounting\n"
-        f"- Detection confidence: low-contrast or partial objects may be missed\n\n"
-        f"Respond in plain language (2-5 sentences). Summarize what the counts mean\n"
-        f"and whether you need more investigation.\n\n"
-        f"{answer_block}"
-    )
-
-
 def build_reason_shortcircuit_prompt(question, reason_question, findings_text):
-    """Step 6 variant for explicit reason action (short-circuit from step 2)."""
+    """Reason action short-circuit (from step 2, skips steps 3-4)."""
     return (
         f"QUESTION: \"{question}\"\n\n"
         f"INVESTIGATION SO FAR:\n{findings_text}\n\n"
@@ -878,22 +830,21 @@ def build_reason_shortcircuit_prompt(question, reason_question, findings_text):
         f"3. If critical regions remain unexplored, describe what to investigate next."
     )
 
-# ── Agent Loop (v4 — 6-step iteration) ─────────────────────────────────────────
+# ── Agent Loop (v4 — 4-step iteration) ─────────────────────────────────────────
 
 def run_agent(manager, config: dict, ng_link: str, question: str):
     """Run the v4 agent loop with OLMo reasoning + Molmo vision.
 
-    6-step iteration:
-        1. OLMo: investigation plan (natural language)
-        2. OLMo: action decision (strict JSON from schema)
-        3. OLMo: vision instructions for Molmo2
-        4. System: capture view (screenshot / scan / count frames)
-        5. Molmo2: interpret the captured view
-        6. OLMo: reasoning over finding → continue or answer
+    4-step iteration:
+        1. OLMo (think=True):  reason over last finding + plan next action
+        2. OLMo (think=False): action JSON (with vision_prompt) from schema
+        3. System: capture view (screenshot / scan / count frames)
+        4. Molmo2: interpret the captured view
 
-    Steps 1-3 and 6 run on OLMo (one swap_to_olmo call stays active).
-    Steps 4-5 run on Molmo2 (swap_to_molmo).
-    Short-circuit: if step 2 outputs reason or answer, steps 3-5 are skipped.
+    Steps 1-2 run on OLMo (one swap_to_olmo call).
+    Steps 3-4 run on Molmo2 (swap_to_molmo).
+    One OLMo swap saved per iteration vs the 6-step design.
+    Short-circuit: if step 2 outputs reason or answer, steps 3-4 are skipped.
     """
     from neuroglancer_state import NeuroglancerState
     from playwright.sync_api import sync_playwright
@@ -977,6 +928,9 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
     max_consecutive_duplicates = 3
     final_answer = None
     max_iter = config["max_agent_iterations"]
+    min_iter = config.get("min_iterations_before_answer", 3)
+    last_finding = None   # carried from iteration N to N+1 for reasoning
+    last_fov = None
 
     print(f"\n[Agent] Starting loop (max {max_iter} iterations)")
     print(f"  Question: {question}\n")
@@ -1025,7 +979,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             "fov_feedback": "[user's original view — default zoom and position]",
         })
 
-        # ── 6-step agent loop ────────────────────────────────────────
+        # ── 4-step agent loop ────────────────────────────────────────
         for iteration in range(1, max_iter + 1):
             print(f"\n{'='*60}")
             print(f"  Iteration {iteration}/{max_iter}")
@@ -1035,12 +989,14 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
 
             findings_text = format_structured_findings(history)
 
-            # ── Step 1: OLMo investigation plan ──────────────────────
+            # ── Step 1: OLMo reason + plan (think=True) ──────────────
             manager.swap_to_olmo()
-            print("\n  [Step 1] OLMo: Investigation plan ...")
+            print("\n  [Step 1] OLMo: Reason + Plan ...")
             plan_prompt = build_plan_prompt(
                 question, volume_info, first_look_finding, findings_text,
                 iteration, max_iter,
+                last_finding=last_finding, last_fov=last_fov,
+                min_iter=min_iter,
             )
             t0 = time.time()
             plan_text, tokens, _ = ask_text_olmo(
@@ -1049,13 +1005,48 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 sampling=config["olmo_sampling_structured"],
             )
             elapsed = time.time() - t0
-            track(iteration, "plan", tokens, "olmo", elapsed)
-            log_exchange(iteration, "step1_plan", plan_prompt, plan_text,
+            track(iteration, "reason_plan", tokens, "olmo", elapsed)
+            log_exchange(iteration, "step1_reason_plan", plan_prompt, plan_text,
                          tokens, elapsed=elapsed,
                          think_content=tokens.get("think_content"))
+
+            # Handle truncated think: retry with think=False
+            if tokens.get("was_truncated") and not plan_text.strip():
+                print("  [Retry] Think truncated — retrying with think=False")
+                t0 = time.time()
+                plan_text, tokens, _ = ask_text_olmo(
+                    manager, OLMO_SYSTEM_PROMPT, plan_prompt,
+                    max_new_tokens=config["olmo_max_new_tokens_plan"],
+                    sampling=config["olmo_sampling_structured"],
+                    think=False,
+                )
+                elapsed = time.time() - t0
+                track(iteration, "reason_plan_retry", tokens, "olmo", elapsed)
+                log_exchange(iteration, "step1_reason_plan_retry", plan_prompt,
+                             plan_text, tokens, elapsed=elapsed)
+
             print(f"  Plan: {plan_text[:300]}...")
 
-            # ── Step 2: OLMo action decision (strict JSON) ──────────
+            # Check if OLMo decided to answer in step 1
+            min_answer_iter = min(min_iter, max_iter)
+            embedded = parse_action(plan_text)
+            if embedded and embedded.get("action") == "answer":
+                if iteration < min_answer_iter:
+                    print(f"  [BLOCKED] OLMo tried to answer on iteration "
+                          f"{iteration} (min={min_answer_iter}). Continuing.")
+                else:
+                    final_answer = embedded.get("answer", plan_text)
+                    print(f"\n  [ANSWER from step 1] {final_answer}")
+                    history.append({
+                        "iteration": iteration,
+                        "action_data": {"action": "answer",
+                                        "answer": final_answer},
+                        "finding": final_answer,
+                        "fov_feedback": "",
+                    })
+                    break
+
+            # ── Step 2: OLMo action + vision_prompt (think=False) ────
             print("\n  [Step 2] OLMo: Action decision ...")
             action_prompt = build_action_prompt(plan_text, volume_info, config)
             t0 = time.time()
@@ -1106,8 +1097,11 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             action_type = action.get("action", "unknown")
             print(f"\n  [Action] {action_type}")
 
+            # Extract vision_prompt from action JSON (merged from old step 3)
+            olmo_instructions = action.pop("vision_prompt", "")
+            target_refinement = action.pop("target_refinement", "")
+
             # ── Short-circuit: answer ────────────────────────────────
-            min_answer_iter = min(config.get("min_iterations_before_answer", 3), max_iter)
             if action_type == "answer":
                 if iteration < min_answer_iter:
                     print(f"  [BLOCKED] OLMo tried to answer on iteration "
@@ -1132,17 +1126,17 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     })
                     break
 
-            # ── Short-circuit: reason (skip steps 3-5) ───────────────
+            # ── Short-circuit: reason (skip steps 3-4) ───────────────
             if action_type == "reason":
                 reason_q = action.get("question", "Synthesize findings.")
-                print("  [Short-circuit] reason — skipping steps 3-5")
+                print("  [Short-circuit] reason — skipping steps 3-4")
                 reason_prompt = build_reason_shortcircuit_prompt(
                     question, reason_q, findings_text,
                 )
                 t0 = time.time()
                 finding, tokens, _ = ask_text_olmo(
                     manager, OLMO_SYSTEM_PROMPT, reason_prompt,
-                    max_new_tokens=config["olmo_max_new_tokens_reasoning"],
+                    max_new_tokens=config["olmo_max_new_tokens_plan"],
                     sampling=config["olmo_sampling_structured"],
                 )
                 elapsed = time.time() - t0
@@ -1165,6 +1159,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     })
                     break
 
+                last_finding = finding
+                last_fov = ""
                 history.append({
                     "iteration": iteration,
                     "action_data": action,
@@ -1191,7 +1187,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 t0 = time.time()
                 finding, tokens, _ = ask_text_olmo(
                     manager, OLMO_SYSTEM_PROMPT, dup_prompt,
-                    max_new_tokens=config["olmo_max_new_tokens_reasoning"],
+                    max_new_tokens=config["olmo_max_new_tokens_plan"],
                     sampling=config["olmo_sampling_structured"],
                 )
                 elapsed = time.time() - t0
@@ -1201,6 +1197,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                              think_content=tokens.get("think_content"))
                 print(f"  Forced reasoning: {finding[:200]}...")
 
+                last_finding = finding
+                last_fov = ""
                 history.append({
                     "iteration": iteration,
                     "action_data": {"action": "reason",
@@ -1212,42 +1210,23 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             else:
                 consecutive_duplicates = 0
 
-            # ── Step 3: OLMo vision instructions for Molmo2 ─────────
-            print("\n  [Step 3] OLMo: Vision instructions ...")
-            instr_prompt = build_vision_instructions_prompt(
-                action, question, findings_text,
-            )
-            t0 = time.time()
-            olmo_instructions, tokens, _ = ask_text_olmo(
-                manager, OLMO_SYSTEM_PROMPT, instr_prompt,
-                max_new_tokens=config["olmo_max_new_tokens_vision_instr"],
-                sampling=config["olmo_sampling_structured"],
-                think=False,
-            )
-            elapsed = time.time() - t0
-            track(iteration, "vision_instructions", tokens, "olmo", elapsed)
-            log_exchange(iteration, "step3_vision_instr", instr_prompt,
-                         olmo_instructions, tokens, elapsed=elapsed,
-                         think_content=tokens.get("think_content"))
-            print(f"  Instructions: {olmo_instructions[:200]}...")
-
-            # ── Steps 4-5: Molmo2 capture + interpret ────────────────
+            # ── Steps 3-4: Molmo2 capture + interpret ────────────────
             manager.swap_to_molmo()
             finding = ""
             fov_feedback = ""
 
             if action_type == "screenshot":
-                # Step 4: Capture screenshot
+                # Step 3: Capture screenshot
                 view_spec = action.get("view", {})
                 screenshot_count += 1
                 state = build_clean_state(base_state, view_spec, volume_info)
                 img = capture_screenshot(page, state, screenshot_count)
 
-                # Step 5: Molmo2 interprets
+                # Step 4: Molmo2 interprets
                 interpret_prompt = build_molmo_screenshot_prompt(
                     olmo_instructions, question, action, volume_info,
                 )
-                print(f"  [Step 5] Molmo2: Interpreting screenshot ...")
+                print(f"  [Step 4] Molmo2: Interpreting screenshot ...")
                 t0 = time.time()
                 finding, tokens = ask_vision(
                     manager.molmo_model, manager.molmo_processor,
@@ -1255,7 +1234,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 )
                 elapsed = time.time() - t0
                 track(iteration, "interpret_screenshot", tokens, "molmo", elapsed)
-                log_exchange(iteration, "step5_interpret", interpret_prompt,
+                log_exchange(iteration, "step4_interpret", interpret_prompt,
                              finding, tokens,
                              f"image: view_{screenshot_count:03d}.png", elapsed)
                 print(f"  Finding: {finding[:200]}...")
@@ -1269,7 +1248,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 print(f"  {fov_feedback}")
 
             elif action_type == "scan":
-                # Step 4: Capture scan
+                # Step 3: Capture scan
                 scan_count += 1
                 geo_fp = _geometry_fingerprint(action)
                 if geo_fp in frame_cache:
@@ -1292,12 +1271,12 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 total_dist = float(np.linalg.norm(e - s))
                 frame_spacing = total_dist / max(len(frames) - 1, 1)
 
-                # Step 5: Molmo2 interprets scan
+                # Step 4: Molmo2 interprets scan
                 interpret_prompt = build_molmo_scan_prompt(
                     olmo_instructions, question, action, volume_info,
                     len(frames), frame_spacing, total_dist,
                 )
-                print(f"  [Step 5] Molmo2: Interpreting scan "
+                print(f"  [Step 4] Molmo2: Interpreting scan "
                       f"({len(frames)} frames) ...")
                 t0 = time.time()
                 finding, tokens = ask_scan(
@@ -1307,14 +1286,14 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 )
                 elapsed = time.time() - t0
                 track(iteration, "interpret_scan", tokens, "molmo", elapsed)
-                log_exchange(iteration, "step5_interpret_scan", interpret_prompt,
+                log_exchange(iteration, "step4_interpret_scan", interpret_prompt,
                              finding, tokens,
                              f"video: scan_{scan_count:03d}.mp4, "
                              f"{len(frames)} frames", elapsed)
                 print(f"  Finding: {finding[:200]}...")
 
             elif action_type == "count":
-                # Step 4: Capture + per-keyframe pointing
+                # Step 3: Capture + per-keyframe pointing
                 scan_count += 1
                 target = action.get("target", "objects")
 
@@ -1329,18 +1308,16 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     if geo_fp:
                         frame_cache[geo_fp] = frames
 
-                # Step 5: Per-keyframe pointing with OLMo-refined target
+                # Step 4: Per-keyframe pointing
                 keyframe_interval = max(1, int(
                     action.get("keyframe_interval", 5)))
                 keyframe_indices = list(range(0, len(frames),
                                               keyframe_interval))
-                print(f"  [Step 5] Pointing to '{target}' on "
+                print(f"  [Step 4] Pointing to '{target}' on "
                       f"{len(keyframe_indices)} keyframes ...")
 
                 # Build pointing prompt: always start with "Point to each"
-                # so Molmo2 produces coordinates, then append OLMo's
-                # refinement for specificity.
-                refinement = olmo_instructions.strip()
+                refinement = target_refinement.strip()
                 if refinement:
                     point_prompt = f"Point to each {target}. {refinement}"
                 else:
@@ -1378,7 +1355,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 if points:
                     annotate_scan_frames(frames, points, scan_count)
 
-                # Build pointing stats for OLMo reasoning (step 6)
+                # Build pointing stats for next iteration's reasoning
                 scan_start = action.get("start", {})
                 scan_end = action.get("end", {})
                 s = np.array([scan_start.get("x", cx), scan_start.get("y", cy),
@@ -1442,63 +1419,13 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     f"DETECTED (automated pointing): {len(points)} instances "
                     f"of '{target}' across {len(frame_ids)}/"
                     f"{len(keyframe_indices)} keyframes "
-                    f"(from {len(frames)} total frames)."
+                    f"(from {len(frames)} total frames).\n"
+                    f"{pointing_stats}"
                 )
 
-            # ── Step 6: OLMo reasoning over finding ─────────────────
-            manager.swap_to_olmo()
-            print(f"\n  [Step 6] OLMo: Reasoning over finding ...")
-
-            min_iter = config.get("min_iterations_before_answer", 3)
-            if action_type == "count":
-                reasoning_prompt = build_count_reasoning_prompt(
-                    question, target, pointing_stats, findings_text,
-                    iteration, max_iter=max_iter, min_iter=min_iter,
-                )
-            else:
-                reasoning_prompt = build_reasoning_prompt(
-                    question, finding, findings_text, iteration,
-                    max_iter=max_iter, min_iter=min_iter,
-                    fov_feedback=fov_feedback,
-                )
-
-            t0 = time.time()
-            reasoning_text, tokens, _ = ask_text_olmo(
-                manager, OLMO_SYSTEM_PROMPT, reasoning_prompt,
-                max_new_tokens=config["olmo_max_new_tokens_reasoning"],
-                sampling=config["olmo_sampling_structured"],
-            )
-            elapsed = time.time() - t0
-            track(iteration, "reasoning", tokens, "olmo", elapsed)
-            log_exchange(iteration, "step6_reasoning", reasoning_prompt,
-                         reasoning_text, tokens, elapsed=elapsed,
-                         think_content=tokens.get("think_content"))
-            print(f"  Reasoning: {reasoning_text[:200]}...")
-
-            # Append OLMo interpretation to count findings
-            if action_type == "count":
-                finding += f" {reasoning_text}"
-
-            # Check if OLMo decided to answer in step 6
-            # Block early answers — require min_iterations_before_answer
-            min_answer_iter = min(config.get("min_iterations_before_answer", 3), max_iter)
-            embedded = parse_action(reasoning_text)
-            if embedded and embedded.get("action") == "answer":
-                if iteration < min_answer_iter:
-                    print(f"  [BLOCKED] OLMo tried to answer on iteration "
-                          f"{iteration} (min={min_answer_iter}). Continuing.")
-                    embedded = None  # force continuation
-                else:
-                    final_answer = embedded.get("answer", reasoning_text)
-                    print(f"\n  [ANSWER from step 6] {final_answer}")
-                history.append({
-                    "iteration": iteration,
-                    "action_data": {"action": "answer",
-                                    "answer": final_answer},
-                    "finding": final_answer,
-                    "fov_feedback": fov_feedback,
-                })
-                break
+            # ── Carry finding to next iteration's step 1 ────────────
+            last_finding = finding
+            last_fov = fov_feedback
 
             # ── Append finding to history ───────────────────────────
             history.append({
@@ -1563,7 +1490,7 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     # OLMo system prompt
     md.append("---\n")
     md.append("## OLMo System Prompt\n")
-    md.append("Sent as system role in every OLMo call (steps 1, 2, 3, 6).\n")
+    md.append("Sent as system role in every OLMo call (steps 1, 2).\n")
     md.append("```")
     md.append(OLMO_SYSTEM_PROMPT)
     md.append("```\n")
@@ -1583,11 +1510,11 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     )
     md.append("```\n")
 
-    # Step 1: Investigation Plan (OLMo)
+    # Step 1: Reason + Plan (OLMo, think=True)
     md.append("---\n")
-    md.append("## Step 1: Investigation Plan (OLMo, text-only)\n")
+    md.append("## Step 1: Reason + Plan (OLMo, think=True)\n")
     md.append(f"Token budget: {config['olmo_max_new_tokens_plan']}\n")
-    md.append("### Iteration 1 variant:\n```")
+    md.append("### Iteration 1 variant (plan only):\n```")
     md.append(
         'You have examined a 3D volume and received this initial description:\n'
         '"{first_look_finding}"\n\n'
@@ -1595,17 +1522,20 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
         f'VOLUME:\n{volume_info.format_for_prompt()}\n\n'
         'Plan your investigation strategy. What should you look at first, and why?'
     )
-    md.append("```\n### Iteration N variant:\n```")
+    md.append("```\n### Iteration N variant (reason + plan):\n```")
     md.append(
         f'QUESTION: "{question}"\n\n'
+        'LATEST FINDING (iteration N-1):\n{last_finding}\n\n'
         'INVESTIGATION SO FAR:\n{findings_text}\n\n'
-        'Iteration N/M. What should you investigate next, and why?'
+        'PART 1 — REASONING: Analyze the latest finding in context.\n'
+        'PART 2 — PLAN: What should you investigate next?\n\n'
+        'If enough evidence: {"action": "answer", "answer": "..."}'
     )
     md.append("```\n")
 
-    # Step 2: Action Decision (OLMo)
+    # Step 2: Action + Vision Prompt (OLMo, think=False)
     md.append("---\n")
-    md.append("## Step 2: Action Decision (OLMo, text-only)\n")
+    md.append("## Step 2: Action + Vision Prompt (OLMo, think=False)\n")
     md.append(f"Token budget: {config['olmo_max_new_tokens_decision']}\n")
     md.append("### Action Schema:\n```")
     md.append(build_action_schema(volume_info, config["max_scan_frames"]))
@@ -1613,37 +1543,19 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     md.append(
         'YOUR INVESTIGATION PLAN:\n{plan_text}\n\n'
         '{action_schema}\n\n'
-        'Output ONLY the JSON action object that executes your plan — no other text.\n'
-        'Include a "purpose" field explaining what you expect to learn.\n\n'
+        'Output ONLY the JSON action object.\n'
+        'Include "purpose", "vision_prompt" (2-4 sentences for vision model),\n'
+        'and for count actions, "target_refinement" (1-2 sentences).\n\n'
         'If you already have enough evidence, use the answer action instead.'
     )
     md.append("```\n")
 
-    # Step 3: Vision Instructions (OLMo)
+    # Steps 3-4: Molmo2 Interpretation
     md.append("---\n")
-    md.append("## Step 3: Vision Instructions (OLMo, text-only)\n")
-    md.append(f"Token budget: {config['olmo_max_new_tokens_vision_instr']}\n")
-    md.append("### Screenshot/scan variant:\n```")
-    md.append(
-        'You have planned this view:\n{action_json}\n\n'
-        'PURPOSE: {purpose}\nQUESTION: "{question}"\n\n'
-        'RECENT FINDINGS:\n{last_findings}\n\n'
-        'Write specific instructions for the vision model (2-4 sentences).'
-    )
-    md.append("```\n### Count variant:\n```")
-    md.append(
-        'You have planned a count action:\n{action_json}\n\n'
-        'PURPOSE: {purpose}\nTARGET: "{target}"\n\n'
-        'Refine the target description for the pointing model (1-2 sentences).'
-    )
-    md.append("```\n")
-
-    # Step 5: Molmo2 Interpretation
-    md.append("---\n")
-    md.append("## Step 5: Screenshot Interpret (Molmo2, image + text)\n")
+    md.append("## Step 4: Screenshot Interpret (Molmo2, image + text)\n")
     md.append("```")
     md.append(
-        '{olmo_instructions}\n\n---\n\n'
+        '{vision_prompt from action JSON}\n\n---\n\n'
         f'Question: "{question}"\n\n'
         'This is a {{layout}} view at position (x, y, z), zoom={{zoom}}.\n'
         f'{volume_info.format_for_prompt()}\n\n'
@@ -1652,10 +1564,10 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     md.append("```\n")
 
     md.append("---\n")
-    md.append("## Step 5: Scan Interpret (Molmo2, video + text)\n")
+    md.append("## Step 4: Scan Interpret (Molmo2, video + text)\n")
     md.append("```")
     md.append(
-        '{olmo_instructions}\n\n---\n\n'
+        '{vision_prompt from action JSON}\n\n---\n\n'
         f'Question: "{question}"\n\n'
         'Scan: {{num_frames}} frames along {{axis}}, ~{{spacing}}\u00b5m between frames.\n'
         'Describe what you observe across the frames.'
@@ -1663,37 +1575,15 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     md.append("```\n")
 
     md.append("---\n")
-    md.append("## Step 5: Count Pointing (Molmo2, image + text)\n")
-    md.append("OLMo-refined target description sent per keyframe.\n")
+    md.append("## Step 4: Count Pointing (Molmo2, image + text)\n")
+    md.append("target_refinement from action JSON appended after 'Point to each {target}.'\n")
     md.append("```")
-    md.append("{olmo_refined_target_description}")
-    md.append("```\n")
-
-    # Step 6: OLMo Reasoning
-    md.append("---\n")
-    md.append("## Step 6: Reasoning (OLMo, text-only)\n")
-    md.append(f"Token budget: {config['olmo_max_new_tokens_reasoning']}\n")
-    md.append("### Screenshot/scan variant:\n```")
-    md.append(
-        f'QUESTION: "{question}"\n\n'
-        'NEW FINDING (iteration N):\n{finding}\n\n'
-        'INVESTIGATION SO FAR:\n{findings_text}\n\n'
-        'Analyze the new finding. Confirm, contradict, or extend prior findings.\n'
-        'If enough evidence, respond with: {"action": "answer", "answer": "..."}'
-    )
-    md.append("```\n### Count variant:\n```")
-    md.append(
-        f'QUESTION: "{question}"\n\n'
-        'COUNT RESULTS (iteration N):\nTarget: "{{target}}"\n{pointing_stats}\n\n'
-        'INVESTIGATION SO FAR:\n{findings_text}\n\n'
-        'Interpret detections: account for double-counting, keyframe spacing vs '
-        'object size, detection confidence.'
-    )
+    md.append("Point to each {target}. {target_refinement}")
     md.append("```\n")
 
     # Forced Answer
     md.append("---\n")
-    md.append("## Forced Answer / Synthesis (OLMo, text-only)\n")
+    md.append("## Forced Answer / Synthesis (OLMo, think=True)\n")
     md.append(f"Token budget: {config['olmo_max_new_tokens_synthesis']}\n")
     md.append("```")
     md.append(
