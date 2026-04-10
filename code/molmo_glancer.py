@@ -110,10 +110,9 @@ Your partner is a vision model (Molmo2) that captures and interprets
 screenshots and video scans of the data. You cannot see images directly.
 You plan what views to capture, and Molmo2 reports back what it sees.
 
-RESPONSE FORMAT: Start your response DIRECTLY with the requested output.
-Do NOT begin with "Okay", "Let me think", or internal reasoning.
-If you use <think> tags, keep thinking under 200 words.
-When JSON is requested, output ONLY the JSON object — nothing else."""
+Keep your thinking brief. Respond directly with the requested format:
+- For plans and reasoning: use concise natural language (2-5 sentences).
+- For action decisions: output ONLY a JSON object, no other text."""
 
 
 def strip_think_tokens(text: str) -> tuple[str, str, bool]:
@@ -208,10 +207,15 @@ def ask_text_olmo(manager, system_prompt: str, user_prompt: str,
     if was_truncated:
         print(f"  WARNING: OLMo think block truncated at {max_new_tokens} tokens")
 
+    think_tok_count = (
+        sum(len(tokenizer.encode(b)) for b in think_content.split('\n'))
+        if think_content else 0
+    )
     token_counts = {
         "input_tokens": input_len,
         "output_tokens": len(generated),
-        "think_tokens": sum(len(tokenizer.encode(b)) for b in think_content.split('\n')) if think_content else 0,
+        "think_tokens": think_tok_count,
+        "think_content": think_content if think_content else "",
     }
 
     return clean_text, token_counts, raw_text
@@ -863,7 +867,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
     transcript_path.write_text("# molmo-glancer — Transcript\n\n")
 
     def log_exchange(iteration, step, prompt, response, tokens=None,
-                     note=None, elapsed=None):
+                     note=None, elapsed=None, think_content=None):
         """Append a prompt/response pair to the transcript file."""
         def _blockquote(text):
             return "\n".join(f"> {line}" for line in str(text).split("\n"))
@@ -875,7 +879,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             meta_parts = []
             if tokens:
                 tok_str = f"{tokens['input_tokens']} in / {tokens['output_tokens']} out"
-                if "think_tokens" in tokens:
+                if tokens.get("think_tokens", 0) > 0:
                     tok_str += f" ({tokens['think_tokens']} think)"
                 meta_parts.append(f"Tokens: {tok_str}")
             if elapsed is not None:
@@ -884,6 +888,10 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 f.write(f"**{' | '.join(meta_parts)}**\n\n")
             f.write(f"### Prompt\n\n{_blockquote(prompt)}\n\n")
             f.write(f"### Response\n\n{_blockquote(response)}\n\n")
+            if think_content:
+                f.write(f"<details>\n<summary>Thinking ({tokens.get('think_tokens', '?')} tokens)</summary>\n\n")
+                f.write(f"{_blockquote(think_content)}\n\n")
+                f.write(f"</details>\n\n")
 
     # ── Parse NG state and discover volume ──────────────────────────
     print("\n[Setup] Parsing NG link and discovering volume metadata ...")
@@ -896,24 +904,31 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
     # ── Token tracking ──────────────────────────────────────────────────
     token_usage = {
         "iterations": [],
-        "totals": {"input_tokens": 0, "output_tokens": 0},
+        "totals": {"input_tokens": 0, "output_tokens": 0, "think_tokens": 0},
         "by_model": {
             "molmo": {"input_tokens": 0, "output_tokens": 0},
-            "olmo": {"input_tokens": 0, "output_tokens": 0},
+            "olmo": {"input_tokens": 0, "output_tokens": 0, "think_tokens": 0},
         },
     }
 
     def track(iteration, step, tokens, model_name="molmo", elapsed=None):
-        entry = {"iteration": iteration, "step": step, "model": model_name, **tokens}
+        # Exclude think_content (big string) from serializable entry
+        nums = {k: v for k, v in tokens.items() if k != "think_content"}
+        entry = {"iteration": iteration, "step": step, "model": model_name, **nums}
         if elapsed is not None:
             entry["elapsed_s"] = round(elapsed, 1)
         token_usage["iterations"].append(entry)
         token_usage["totals"]["input_tokens"] += tokens["input_tokens"]
         token_usage["totals"]["output_tokens"] += tokens["output_tokens"]
+        think = tokens.get("think_tokens", 0)
+        token_usage["totals"]["think_tokens"] += think
         token_usage["by_model"][model_name]["input_tokens"] += tokens["input_tokens"]
         token_usage["by_model"][model_name]["output_tokens"] += tokens["output_tokens"]
+        if "think_tokens" in token_usage["by_model"][model_name]:
+            token_usage["by_model"][model_name]["think_tokens"] += think
         t_str = f" ({elapsed:.1f}s)" if elapsed is not None else ""
-        print(f"    [{model_name}] {tokens['input_tokens']} in / {tokens['output_tokens']} out{t_str}")
+        tk_str = f" [{think} think]" if think else ""
+        print(f"    [{model_name}] {tokens['input_tokens']} in / {tokens['output_tokens']} out{tk_str}{t_str}")
 
     # ── Agent loop state ────────────────────────────────────────────────
     history = []          # list of {iteration, action_data, finding, fov_feedback}
@@ -998,7 +1013,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             elapsed = time.time() - t0
             track(iteration, "plan", tokens, "olmo", elapsed)
             log_exchange(iteration, "step1_plan", plan_prompt, plan_text,
-                         tokens, elapsed=elapsed)
+                         tokens, elapsed=elapsed,
+                         think_content=tokens.get("think_content"))
             print(f"  Plan: {plan_text[:300]}...")
 
             # ── Step 2: OLMo action decision (strict JSON) ──────────
@@ -1013,7 +1029,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             elapsed = time.time() - t0
             track(iteration, "action", tokens, "olmo", elapsed)
             log_exchange(iteration, "step2_action", action_prompt, action_text,
-                         tokens, elapsed=elapsed)
+                         tokens, elapsed=elapsed,
+                         think_content=tokens.get("think_content"))
             print(f"  Action text: {action_text[:200]}...")
 
             # Parse JSON action
@@ -1034,7 +1051,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 elapsed = time.time() - t0
                 track(iteration, "action_retry", tokens, "olmo", elapsed)
                 log_exchange(iteration, "step2_retry", retry_prompt, action_text,
-                             tokens, elapsed=elapsed)
+                             tokens, elapsed=elapsed,
+                             think_content=tokens.get("think_content"))
                 action = parse_action(action_text)
 
             if action is None:
@@ -1076,7 +1094,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 elapsed = time.time() - t0
                 track(iteration, "reason_shortcircuit", tokens, "olmo", elapsed)
                 log_exchange(iteration, "reason_shortcircuit", reason_prompt,
-                             finding, tokens, elapsed=elapsed)
+                             finding, tokens, elapsed=elapsed,
+                             think_content=tokens.get("think_content"))
                 print(f"  Reasoning: {finding[:200]}...")
 
                 # Check if OLMo decided to answer within reasoning
@@ -1124,7 +1143,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 elapsed = time.time() - t0
                 track(iteration, "forced_reason", tokens, "olmo", elapsed)
                 log_exchange(iteration, "forced_reason", dup_prompt, finding,
-                             tokens, elapsed=elapsed)
+                             tokens, elapsed=elapsed,
+                             think_content=tokens.get("think_content"))
                 print(f"  Forced reasoning: {finding[:200]}...")
 
                 history.append({
@@ -1152,7 +1172,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             elapsed = time.time() - t0
             track(iteration, "vision_instructions", tokens, "olmo", elapsed)
             log_exchange(iteration, "step3_vision_instr", instr_prompt,
-                         olmo_instructions, tokens, elapsed=elapsed)
+                         olmo_instructions, tokens, elapsed=elapsed,
+                         think_content=tokens.get("think_content"))
             print(f"  Instructions: {olmo_instructions[:200]}...")
 
             # ── Steps 4-5: Molmo2 capture + interpret ────────────────
@@ -1389,7 +1410,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             elapsed = time.time() - t0
             track(iteration, "reasoning", tokens, "olmo", elapsed)
             log_exchange(iteration, "step6_reasoning", reasoning_prompt,
-                         reasoning_text, tokens, elapsed=elapsed)
+                         reasoning_text, tokens, elapsed=elapsed,
+                         think_content=tokens.get("think_content"))
             print(f"  Reasoning: {reasoning_text[:200]}...")
 
             # Append OLMo interpretation to count findings
@@ -1442,7 +1464,8 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
         elapsed = time.time() - t0
         track(max_iter, "forced_answer", tokens, "olmo", elapsed)
         log_exchange(max_iter, "forced_answer", synth_prompt,
-                     answer_text, tokens, elapsed=elapsed)
+                     answer_text, tokens, elapsed=elapsed,
+                     think_content=tokens.get("think_content"))
 
         forced_action = parse_action(answer_text)
         if forced_action and "answer" in forced_action:
