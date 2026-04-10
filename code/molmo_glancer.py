@@ -110,14 +110,10 @@ Your partner is a vision model (Molmo2) that captures and interprets
 screenshots and video scans of the data. You cannot see images directly.
 You plan what views to capture, and Molmo2 reports back what it sees.
 
-Your job is to:
-1. Plan efficient sequences of views that answer the question
-2. Reason about findings — resolve contradictions, identify gaps, estimate quantities
-3. Decide when you have enough evidence to answer confidently
-
-Keep your thinking brief and focused. Do not speculate at length — state your
-reasoning in 2-3 sentences, then give your answer or next action directly.
-Avoid restating the question or rehashing prior findings unnecessarily."""
+RESPONSE FORMAT: Start your response DIRECTLY with the requested output.
+Do NOT begin with "Okay", "Let me think", or internal reasoning.
+If you use <think> tags, keep thinking under 200 words.
+When JSON is requested, output ONLY the JSON object — nothing else."""
 
 
 def strip_think_tokens(text: str) -> tuple[str, str, bool]:

@@ -27,25 +27,25 @@ CONFIG = {
     "max_context_tokens": 55000,
     # OLMo 3.1 32B Think (text reasoning)
     "max_olmo_context_tokens": 32000,
-    # OLMo generation budgets — aggressive debug values (restore for prod)
-    "olmo_max_new_tokens_plan": 512,
-    "olmo_max_new_tokens_decision": 512,
-    "olmo_max_new_tokens_vision_instr": 256,
-    "olmo_max_new_tokens_reasoning": 1024,
-    "olmo_max_new_tokens_synthesis": 1536,
-    "olmo_max_new_tokens_retry": 256,
-    "olmo_max_new_tokens_hard_cap": 2048,
-    # OLMo sampling presets (deep-dive §16.2)
+    # OLMo generation budgets — moderate debug (model needs room to think + answer)
+    "olmo_max_new_tokens_plan": 1536,
+    "olmo_max_new_tokens_decision": 1024,
+    "olmo_max_new_tokens_vision_instr": 768,
+    "olmo_max_new_tokens_reasoning": 2048,
+    "olmo_max_new_tokens_synthesis": 2048,
+    "olmo_max_new_tokens_retry": 768,
+    "olmo_max_new_tokens_hard_cap": 4096,
+    # OLMo sampling — per HF model card: temp=0.6, top_p=0.95
     "olmo_sampling_structured": {
-        "temperature": 0.2, "top_p": 0.9,
+        "temperature": 0.6, "top_p": 0.95,
         "repetition_penalty": 1.1, "do_sample": True,
     },
     "olmo_sampling_synthesis": {
-        "temperature": 0.5, "top_p": 0.9,
+        "temperature": 0.6, "top_p": 0.95,
         "repetition_penalty": 1.1, "do_sample": True,
     },
     "olmo_sampling_retry": {
-        "temperature": 0.1, "top_p": 0.9,
+        "temperature": 0.3, "top_p": 0.95,
         "repetition_penalty": 1.1, "do_sample": True,
     },
     # Agent loop
