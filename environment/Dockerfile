@@ -1,4 +1,4 @@
-# hash:sha256:d615dd2b7008d903c1c805b30715902b4c5046c383a207719f45b64319d32ebe
+# hash:sha256:41540ce033e8c94defd0106245f0277833e6e193f44a959b06b76499af96ed0a
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/pytorch:2.4.0-cuda12.4.0-mambaforge24.5.0-0-python3.12.4-ubuntu22.04
 
@@ -42,7 +42,7 @@ RUN pip3 install -U --no-cache-dir \
     playwright==1.44.0 \
     s3fs==2026.3.0 \
     scikit-image==0.26.0 \
-    transformers==5.5.3 \
+    transformers==4.57.6 \
     zarr==3.1.6
 
 ADD "https://github.com/coder/code-server/releases/download/v4.100.3/code-server-4.100.3-linux-amd64.tar.gz" /.code-server/code-server.tar.gz
