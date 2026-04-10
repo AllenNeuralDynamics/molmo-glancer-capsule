@@ -801,11 +801,27 @@ def build_molmo_scan_prompt(olmo_instructions, question, action, volume_info,
 
 
 def build_reasoning_prompt(question, finding, findings_text, iteration,
-                           fov_feedback=""):
+                           max_iter=20, min_iter=3, fov_feedback=""):
     """Step 6: OLMo post-finding reasoning."""
     finding_block = finding
     if fov_feedback:
         finding_block += f"\n{fov_feedback}"
+
+    # Don't offer the answer option until min_iter
+    min_answer_iter = min(min_iter, max_iter)
+    if iteration < min_answer_iter:
+        answer_block = (
+            f"You are on iteration {iteration}/{max_iter} — it is TOO EARLY to answer.\n"
+            f"You have only examined one view. Describe what you still need to investigate\n"
+            f"(different orientations, regions, zoom levels, layer toggling)."
+        )
+    else:
+        answer_block = (
+            f"ONLY if you have examined multiple views/orientations and have enough\n"
+            f"evidence to give a final answer, respond instead with:\n"
+            f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}'
+        )
+
     return (
         f"QUESTION: \"{question}\"\n\n"
         f"NEW FINDING (iteration {iteration}):\n{finding_block}\n\n"
@@ -816,14 +832,25 @@ def build_reasoning_prompt(question, finding, findings_text, iteration,
         f"3. Do you have sufficient evidence to answer the question confidently?\n\n"
         f"Respond in plain language (2-5 sentences). Summarize your current understanding\n"
         f"and what remains uncertain.\n\n"
-        f"ONLY if you have enough evidence to give a final answer, respond instead with:\n"
-        f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}'
+        f"{answer_block}"
     )
 
 
 def build_count_reasoning_prompt(question, target, pointing_stats, findings_text,
-                                 iteration):
+                                 iteration, max_iter=20, min_iter=3):
     """Step 6 count variant: OLMo interprets pointing statistics."""
+    min_answer_iter = min(min_iter, max_iter)
+    if iteration < min_answer_iter:
+        answer_block = (
+            f"You are on iteration {iteration}/{max_iter} — it is TOO EARLY to answer.\n"
+            f"Describe what additional counts or views you need to confirm the results."
+        )
+    else:
+        answer_block = (
+            f"ONLY if you have enough evidence to give a final answer, respond instead with:\n"
+            f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}'
+        )
+
     return (
         f"QUESTION: \"{question}\"\n\n"
         f"COUNT RESULTS (iteration {iteration}):\nTarget: \"{target}\"\n"
@@ -835,8 +862,7 @@ def build_count_reasoning_prompt(question, target, pointing_stats, findings_text
         f"- Detection confidence: low-contrast or partial objects may be missed\n\n"
         f"Respond in plain language (2-5 sentences). Summarize what the counts mean\n"
         f"and whether you need more investigation.\n\n"
-        f"ONLY if you have enough evidence to give a final answer, respond instead with:\n"
-        f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}'
+        f"{answer_block}"
     )
 
 
@@ -1081,16 +1107,30 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             print(f"\n  [Action] {action_type}")
 
             # ── Short-circuit: answer ────────────────────────────────
+            min_answer_iter = min(config.get("min_iterations_before_answer", 3), max_iter)
             if action_type == "answer":
-                final_answer = action.get("answer", "")
-                print(f"\n  [ANSWER] {final_answer}")
-                history.append({
-                    "iteration": iteration,
-                    "action_data": action,
-                    "finding": final_answer,
-                    "fov_feedback": "",
-                })
-                break
+                if iteration < min_answer_iter:
+                    print(f"  [BLOCKED] OLMo tried to answer on iteration "
+                          f"{iteration} (min={min_answer_iter}). "
+                          f"Forcing reason instead.")
+                    action = {
+                        "action": "reason",
+                        "question": (
+                            "You tried to answer too early. What views, "
+                            "orientations, or regions still need examination?"
+                        ),
+                    }
+                    action_type = "reason"
+                else:
+                    final_answer = action.get("answer", "")
+                    print(f"\n  [ANSWER] {final_answer}")
+                    history.append({
+                        "iteration": iteration,
+                        "action_data": action,
+                        "finding": final_answer,
+                        "fov_feedback": "",
+                    })
+                    break
 
             # ── Short-circuit: reason (skip steps 3-5) ───────────────
             if action_type == "reason":
@@ -1409,14 +1449,16 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             manager.swap_to_olmo()
             print(f"\n  [Step 6] OLMo: Reasoning over finding ...")
 
+            min_iter = config.get("min_iterations_before_answer", 3)
             if action_type == "count":
                 reasoning_prompt = build_count_reasoning_prompt(
                     question, target, pointing_stats, findings_text,
-                    iteration,
+                    iteration, max_iter=max_iter, min_iter=min_iter,
                 )
             else:
                 reasoning_prompt = build_reasoning_prompt(
                     question, finding, findings_text, iteration,
+                    max_iter=max_iter, min_iter=min_iter,
                     fov_feedback=fov_feedback,
                 )
 
@@ -1438,10 +1480,17 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 finding += f" {reasoning_text}"
 
             # Check if OLMo decided to answer in step 6
+            # Block early answers — require min_iterations_before_answer
+            min_answer_iter = min(config.get("min_iterations_before_answer", 3), max_iter)
             embedded = parse_action(reasoning_text)
             if embedded and embedded.get("action") == "answer":
-                final_answer = embedded.get("answer", reasoning_text)
-                print(f"\n  [ANSWER from step 6] {final_answer}")
+                if iteration < min_answer_iter:
+                    print(f"  [BLOCKED] OLMo tried to answer on iteration "
+                          f"{iteration} (min={min_answer_iter}). Continuing.")
+                    embedded = None  # force continuation
+                else:
+                    final_answer = embedded.get("answer", reasoning_text)
+                    print(f"\n  [ANSWER from step 6] {final_answer}")
                 history.append({
                     "iteration": iteration,
                     "action_data": {"action": "answer",

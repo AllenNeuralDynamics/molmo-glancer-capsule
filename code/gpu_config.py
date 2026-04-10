@@ -15,8 +15,8 @@ import torch
 
 # ── Checkpoints ──────────────────────────────────────────────────────────────
 
-MOLMO_CHECKPOINT = "/scratch/checkpoints/Molmo2-O-7B"
-OLMO_CHECKPOINT = "/scratch/checkpoints/Olmo-3.1-32B-Think"
+MOLMO_CHECKPOINT = "/data/molmo-glancer-v4-models/checkpoints/Molmo2-O-7B"
+OLMO_CHECKPOINT = "/data/molmo-glancer-v4-models/checkpoints/Olmo-3.1-32B-Think"
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -49,7 +49,8 @@ CONFIG = {
         "repetition_penalty": 1.1, "do_sample": True,
     },
     # Agent loop
-    "max_agent_iterations": 20
+    "max_agent_iterations": 20,
+    "min_iterations_before_answer": 3,
 }
 
 MIN_VRAM_GB = 40
