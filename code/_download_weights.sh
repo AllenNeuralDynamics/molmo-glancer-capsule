@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# _download_weights.sh — Download Molmo2-O-7B model weights to /scratch
+# _download_weights.sh — Download model weights to /scratch
 #
-# Molmo2-O-7B: single model serving both visual interpretation and orchestration.
-# Backbone: OLMo3-7B-Instruct + SigLIP2 vision encoder (~14-16 GB on disk).
-# Runtime: ~3.6 GB in 4-bit (T4) or ~14.5 GB in fp16 (L40S).
+# Two models:
+#   1. Molmo2-O-7B: vision model (SigLIP2 + OLMo3-7B backbone), ~14-16 GB on disk, ~14.5 GB fp16
+#   2. OLMo 3.1 32B Think: text reasoning model, ~64 GB on disk, ~34 GB INT8 at runtime
 #
 # HF_TOKEN is required to avoid anonymous rate limits.
 #
@@ -25,8 +25,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # Molmo2-O-7B (~14-16 GB on disk)
-# Model ID: allenai/Molmo2-O-7B
-# Loaded at runtime via: AutoModelForImageTextToText (4-bit or fp16, auto-detected)
+# Vision + image interpretation model (fp16, device_map=auto)
 # ---------------------------------------------------------------------------
 MOLMO2_DEST=/scratch/checkpoints/Molmo2-O-7B
 
@@ -36,17 +35,22 @@ huggingface-cli download allenai/Molmo2-O-7B \
 echo "  Done: $MOLMO2_DEST"
 
 # ---------------------------------------------------------------------------
+# OLMo 3.1 32B Think (~64 GB on disk)
+# Text reasoning model (loaded as INT8 via bitsandbytes, ~34 GB VRAM)
+# ---------------------------------------------------------------------------
+OLMO_DEST=/scratch/checkpoints/Olmo-3.1-32B-Think
+
+echo ""
+echo "--- OLMo 3.1 32B Think (~64 GB, resumes if partial) ---"
+huggingface-cli download allenai/OLMo-3.1-32B-Think \
+    --local-dir "$OLMO_DEST"
+echo "  Done: $OLMO_DEST"
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "=========================================="
 echo " Weights ready."
 echo ""
 echo " Molmo2-O-7B: $MOLMO2_DEST"
-echo ""
-echo " Load in Python:"
-echo "   from transformers import AutoProcessor, AutoModelForImageTextToText"
-echo "   model = AutoModelForImageTextToText.from_pretrained("
-echo "       '$MOLMO2_DEST',"
-echo "       trust_remote_code=True,"
-echo "       device_map='auto',"
-echo "   )"
+echo " OLMo 3.1 32B Think: $OLMO_DEST"
 echo "=========================================="

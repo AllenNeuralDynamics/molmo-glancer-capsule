@@ -21,16 +21,14 @@ import torch
 from PIL import Image
 from molmo_utils import process_vision_info
 
-from gpu_config import load_model, get_vram_usage
+from gpu_config import ModelManager, get_vram_usage, CONFIG
 from volume_info import (
-    VolumeInfo, discover_volume, compute_fov,
-    compute_visible_window, format_fov_feedback,
-    resolve_zoom,
+    VolumeInfo, discover_volume, format_fov_feedback,
+    resolve_zoom, pixel_to_physical, summarize_spatial_distribution,
 )
 from visual_capture import (
     build_clean_state, capture_screenshot, execute_scan,
-    create_browser, VIEWPORT_SIZE, save_scan_video,
-    annotate_screenshot, annotate_scan_frames,
+    create_browser, save_scan_video, annotate_scan_frames,
 )
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -102,16 +100,120 @@ def ask_text(model, processor, prompt: str, max_new_tokens: int = 512):
     return text, {"input_tokens": input_len, "output_tokens": len(generated)}
 
 
-def ask_vision(model, processor, image: Image.Image, prompt: str,
-               max_new_tokens: int = 512, config: dict = None):
-    """Image+text call to Molmo2. Returns (text, token_counts)."""
-    # Downscale if needed (T4 profile)
-    if config and config.get("max_image_side"):
-        max_side = config["max_image_side"]
-        if max(image.size) > max_side:
-            image = image.copy()
-            image.thumbnail((max_side, max_side), Image.LANCZOS)
+# ── OLMo Text Generation ───────────────────────────────────────────────────
 
+OLMO_SYSTEM_PROMPT = """\
+You are the reasoning engine of an autonomous visual analysis system.
+You analyze 3D volumetric microscopy data loaded in Neuroglancer.
+
+Your partner is a vision model (Molmo2) that captures and interprets
+screenshots and video scans of the data. You cannot see images directly.
+You plan what views to capture, and Molmo2 reports back what it sees.
+
+Your job is to:
+1. Plan efficient sequences of views that answer the question
+2. Reason about findings — resolve contradictions, identify gaps, estimate quantities
+3. Decide when you have enough evidence to answer confidently
+
+Think carefully before acting. Consider:
+- What spatial regions remain unexplored?
+- Are findings consistent across views? If not, why?
+- What view would most efficiently resolve remaining uncertainty?
+- Are quantitative estimates grounded in actual detections, or guesses?"""
+
+
+def strip_think_tokens(text: str) -> tuple[str, str, bool]:
+    """Extract and separate think blocks from OLMo output.
+
+    Parameters
+    ----------
+    text : str
+        Raw OLMo output potentially containing <think>...</think> blocks.
+
+    Returns
+    -------
+    clean_text : str
+        Output with all think blocks removed.
+    think_content : str
+        Concatenated content of all think blocks.
+    was_truncated : bool
+        True if a <think> block was never closed (model ran out of tokens
+        before producing its actual response).
+    """
+    open_count = text.count("<think>")
+    close_count = text.count("</think>")
+    was_truncated = open_count > close_count
+
+    # Extract closed blocks
+    think_blocks = re.findall(r'<think>(.*?)</think>', text, re.DOTALL)
+    clean = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+
+    # If truncated, also strip the unclosed trailing block
+    if was_truncated:
+        clean = re.sub(r'<think>(?!.*</think>).*$', '', clean, flags=re.DOTALL)
+
+    return clean.strip(), '\n'.join(think_blocks), was_truncated
+
+
+def ask_text_olmo(manager, system_prompt: str, user_prompt: str,
+                  max_new_tokens: int = 4096, sampling: dict | None = None):
+    """OLMo text generation via ChatML system+user roles.
+
+    Handles think token stripping and truncation detection.
+    Returns (text, token_counts) matching ask_text() shape.
+
+    Parameters
+    ----------
+    manager : ModelManager
+        Must have OLMo loaded (manager.active == "olmo").
+    system_prompt : str
+        System role content (OLMo supports native system role).
+    user_prompt : str
+        User role content.
+    max_new_tokens : int
+        Max tokens to generate (includes think + response).
+    sampling : dict or None
+        Sampling parameters (temperature, top_p, etc.). If None, uses
+        CONFIG["olmo_sampling_structured"].
+    """
+    model = manager.olmo_model
+    tokenizer = manager.olmo_tokenizer
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    input_ids = tokenizer.apply_chat_template(
+        messages, return_tensors="pt", add_generation_prompt=True,
+    ).to(model.device)
+    input_len = input_ids.shape[1]
+
+    gen_kwargs = dict(sampling or CONFIG["olmo_sampling_structured"])
+    gen_kwargs["max_new_tokens"] = max_new_tokens
+
+    with torch.inference_mode():
+        output_ids = model.generate(input_ids, **gen_kwargs)
+
+    generated = output_ids[0, input_len:]
+    raw_text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+    clean_text, think_content, was_truncated = strip_think_tokens(raw_text)
+
+    if was_truncated:
+        print(f"  WARNING: OLMo think block truncated at {max_new_tokens} tokens")
+
+    token_counts = {
+        "input_tokens": input_len,
+        "output_tokens": len(generated),
+        "think_tokens": sum(len(tokenizer.encode(b)) for b in think_content.split('\n')) if think_content else 0,
+    }
+
+    return clean_text, token_counts, raw_text
+
+
+def ask_vision(model, processor, image: Image.Image, prompt: str,
+               max_new_tokens: int = 512):
+    """Image+text call to Molmo2. Returns (text, token_counts)."""
     messages = [{"role": "user", "content": [
         {"type": "image", "image": image},
         {"type": "text", "text": prompt},
@@ -208,18 +310,12 @@ def extract_image_points(text: str, image_w: int, image_h: int) -> list[tuple]:
 
 
 def ask_vision_pointing(model, processor, image: Image.Image, prompt: str,
-                        max_new_tokens: int = 2048, config: dict = None):
+                        max_new_tokens: int = 2048):
     """Image pointing call to Molmo2. Returns (raw_text, points, token_counts).
 
     Uses same pipeline as ask_vision but returns parsed points too.
     Points are list of (x, y) tuples in pixel coordinates.
     """
-    if config and config.get("max_image_side"):
-        max_side = config["max_image_side"]
-        if max(image.size) > max_side:
-            image = image.copy()
-            image.thumbnail((max_side, max_side), Image.LANCZOS)
-
     messages = [{"role": "user", "content": [
         {"type": "image", "image": image},
         {"type": "text", "text": prompt},
@@ -524,104 +620,233 @@ Do NOT copy the placeholder — write a prompt specific to your current goal and
 """
 
 
-def build_decision_prompt(question: str, volume_info: VolumeInfo,
-                          history: list[dict], config: dict,
-                          iteration: int, forced_answer: bool = False) -> str:
-    """Build the user message for the agent's next decision."""
-    parts = []
+# ── v4 Structured Findings ─────────────────────────────────────────────────
 
-    # Role and instructions
-    parts.append(
-        "You are a visual data analyst. You explore 3D volumetric data "
-        "by taking screenshots and video scans of a Neuroglancer viewer, "
-        "then synthesize an answer.\n"
-    )
+def format_structured_findings(history: list[dict]) -> str:
+    """Format history entries as structured findings for OLMo prompts."""
+    lines = []
+    for entry in history:
+        iteration = entry.get("iteration", "?")
+        a = entry.get("action_data", {})
+        finding = entry.get("finding", "")
+        fov = entry.get("fov_feedback", "")
+        purpose = a.get("purpose", "")
+        atype = a.get("action", "?")
 
-    if forced_answer:
-        parts.append(
-            "YOU MUST ANSWER NOW. This is the final iteration. "
-            "Provide your best answer based on all findings so far.\n"
-            "Respond with: {\"action\": \"answer\", \"answer\": \"your answer here\"}\n"
-        )
-    else:
-        parts.append(build_action_schema(volume_info, config["max_scan_frames"]))
-
-    # Volume info
-    parts.append(f"\nVOLUME INFO:\n  {volume_info.format_for_prompt()}\n")
-
-    # History
-    if history:
-        max_recent = 10
-        if len(history) > max_recent:
-            older = history[:-max_recent]
-            recent = history[-max_recent:]
-            parts.append(f"\nCOVERAGE SUMMARY (iterations 1-{len(older)}):")
-            summary_lines = []
-            for entry in older:
-                a = entry.get("action_data", {})
-                atype = a.get("action", "?")
-                if atype == "screenshot":
-                    v = a.get("view", {})
-                    summary_lines.append(
-                        f"  [{atype}, {v.get('layout','xy')}, "
-                        f"pos=({v.get('x',0):.0f},{v.get('y',0):.0f},{v.get('z',0):.0f}), "
-                        f"scale={v.get('crossSectionScale',1.0)}]"
-                    )
-                elif atype in ("scan", "count"):
-                    summary_lines.append(f"  [{atype}, {a.get('scan_type','?')}, {a.get('frames',0)} frames]")
-                elif atype == "reason":
-                    reasoning = a.get("reasoning", a.get("question", ""))[:100]
-                    summary_lines.append(f"  [{atype}: {reasoning}...]")
-            parts.append("\n".join(summary_lines))
-
-            parts.append(f"\nRECENT FINDINGS (iterations {len(older)+1}-{len(history)}):")
-            for entry in recent:
-                parts.append(format_history_entry(entry))
+        if iteration == 0:
+            lines.append(f"── Iteration 0 (first look) {'─' * 40}")
         else:
-            parts.append(f"\nFINDINGS SO FAR (iterations 1-{len(history)}):")
-            for entry in history:
-                parts.append(format_history_entry(entry))
+            lines.append(f"── Iteration {iteration} {'─' * 45}")
 
-    parts.append(f"\nQUESTION: {question}")
-    parts.append(f"\nIteration {iteration}/{config['max_agent_iterations']}. What is your next action? Respond with a JSON object.")
+        if atype == "screenshot":
+            v = a.get("view", {})
+            zoom = v.get("zoom", "full")
+            lines.append(f"  View: screenshot, {v.get('layout','xy')}, "
+                         f"pos=({v.get('x',0):.0f},{v.get('y',0):.0f},{v.get('z',0):.0f}), "
+                         f"zoom={zoom}")
+        elif atype in ("scan", "count"):
+            lines.append(f"  View: {atype}, {a.get('scan_type','?')}, "
+                         f"{a.get('frames',0)} frames"
+                         f"{', target=' + a.get('target','') if atype == 'count' else ''}")
+        elif atype == "reason":
+            lines.append(f"  View: reason (no visual input)")
+        else:
+            lines.append(f"  View: {atype}")
 
-    return "\n".join(parts)
+        if purpose:
+            lines.append(f"  Purpose: \"{purpose}\"")
+        if finding:
+            lines.append(f"  Finding: \"{finding[:400]}\"")
+        if fov:
+            lines.append(f"  {fov}")
+        lines.append("")
 
-
-def format_history_entry(entry: dict) -> str:
-    """Format a single history entry for the prompt."""
-    a = entry.get("action_data", {})
-    finding = entry.get("finding", "")
-    fov = entry.get("fov_feedback", "")
-    iteration = entry.get("iteration", "?")
-    atype = a.get("action", "?")
-
-    if atype == "screenshot":
-        v = a.get("view", {})
-        header = (f"  [action {iteration}: screenshot, {v.get('layout','xy')}, "
-                  f"pos=({v.get('x',0):.0f},{v.get('y',0):.0f},{v.get('z',0):.0f}), "
-                  f"scale={v.get('crossSectionScale',1.0)}]")
-    elif atype in ("scan", "count"):
-        header = (f"  [action {iteration}: {atype}, {a.get('scan_type','?')}, "
-                  f"{a.get('frames',0)} frames"
-                  f"{', target=' + a.get('target','') if atype == 'count' else ''}]")
-    elif atype == "reason":
-        header = f"  [action {iteration}: {atype}]"
-    else:
-        header = f"  [action {iteration}: {atype}]"
-
-    lines = [header]
-    if finding:
-        lines.append(f"  [finding {iteration}: \"{finding[:300]}\"]")
-    if fov:
-        lines.append(f"  {fov}")
     return "\n".join(lines)
 
 
-# ── Agent Loop ──────────────────────────────────────────────────────────────
+# ── v4 Prompt Builders (6-step iteration) ──────────────────────────────────
 
-def run_agent(model, processor, config: dict, ng_link: str, question: str):
-    """Run the agent loop. Returns final answer string."""
+def build_plan_prompt(question, volume_info, first_look_finding, findings_text,
+                      iteration, max_iter):
+    """Step 1: OLMo investigation plan (natural language)."""
+    if iteration == 1:
+        return (
+            f"You have examined a 3D volume and received this initial description:\n"
+            f"\"{first_look_finding}\"\n\n"
+            f"QUESTION: \"{question}\"\n\n"
+            f"VOLUME:\n{volume_info.format_for_prompt()}\n\n"
+            f"Plan your investigation strategy. What should you look at first, and why?\n\n"
+            f"Consider:\n"
+            f"- What spatial regions need examination to answer the question?\n"
+            f"- Would a different layout (xy vs xz vs yz) reveal different information?\n"
+            f"- Would a scan (video sweep) show spatial distribution better than a static view?\n"
+            f"- Would toggling layer visibility reveal alignment, segmentation quality, etc.?\n"
+            f"- Is the question quantitative (need count action) or qualitative (scan/screenshot)?"
+        )
+    return (
+        f"QUESTION: \"{question}\"\n\n"
+        f"INVESTIGATION SO FAR:\n\n{findings_text}\n\n"
+        f"Iteration {iteration}/{max_iter}. What should you investigate next, and why?\n\n"
+        f"Consider what spatial regions remain unexplored, whether findings are\n"
+        f"consistent, and whether you have enough evidence to answer."
+    )
+
+
+def build_action_prompt(plan_text, volume_info, config):
+    """Step 2: OLMo strict JSON action from schema."""
+    schema = build_action_schema(volume_info, config["max_scan_frames"])
+    return (
+        f"YOUR INVESTIGATION PLAN:\n{plan_text}\n\n"
+        f"{schema}\n\n"
+        f"Output the JSON action that executes your plan. Include a \"purpose\" field\n"
+        f"explaining what you expect to learn from this view.\n\n"
+        f"If you already have enough evidence, use the answer action instead."
+    )
+
+
+def build_vision_instructions_prompt(action, question, findings_text):
+    """Step 3: OLMo crafts instructions for Molmo2."""
+    action_type = action.get("action", "")
+    purpose = action.get("purpose", "")
+    action_summary = json.dumps(action, indent=2)[:500]
+
+    findings_lines = findings_text.strip().split("\n── ")
+    last_findings = "\n── ".join(findings_lines[-2:]) if len(findings_lines) >= 2 else findings_text[-500:]
+
+    if action_type == "count":
+        target = action.get("target", "objects")
+        return (
+            f"You have planned a count action:\n{action_summary}\n\n"
+            f"PURPOSE: {purpose}\nTARGET: \"{target}\"\n\n"
+            f"The vision model will point to each instance of the target on sampled keyframes.\n"
+            f"Refine the target description to help the model identify the right objects:\n"
+            f"- What size and shape are the targets?\n"
+            f"- What intensity or color distinguishes them from background?\n"
+            f"- Should the model ignore any similar-looking artifacts?\n\n"
+            f"Output a refined pointing instruction (1-2 sentences)."
+        )
+    return (
+        f"You have planned this view:\n{action_summary}\n\n"
+        f"PURPOSE: {purpose}\nQUESTION: \"{question}\"\n\n"
+        f"RECENT FINDINGS:\n{last_findings}\n\n"
+        f"Write specific instructions for the vision model that will interpret this view.\n"
+        f"Tell it:\n- What specific features or structures to focus on\n"
+        f"- What region of the image matters most for this investigation\n"
+        f"- What to compare against prior findings (if any)\n"
+        f"- Any artifacts or confounds to watch for\n\n"
+        f"Keep it concise (2-4 sentences)."
+    )
+
+
+def build_molmo_screenshot_prompt(olmo_instructions, question, action, volume_info):
+    """Build Molmo2 screenshot interpretation prompt with OLMo-crafted instructions."""
+    view = action.get("view", {})
+    layout = view.get("layout", "xy")
+    x, y, z = view.get("x", 0), view.get("y", 0), view.get("z", 0)
+    zoom = view.get("zoom", "full")
+    return (
+        f"{olmo_instructions}\n\n---\n\n"
+        f"Question: \"{question}\"\n\n"
+        f"This is a {layout} view at position ({x:.0f}, {y:.0f}, {z:.0f}), zoom={zoom}.\n"
+        f"{volume_info.format_for_prompt()}\n\n"
+        f"Describe what you see. Report:\n"
+        f"- What structures are present (type, shape, intensity)\n"
+        f"- Approximate counts if objects are discrete and countable\n"
+        f"- Spatial distribution (clustered, uniform, sparse/dense regions)\n"
+        f"- Anything unusual or noteworthy"
+    )
+
+
+def build_molmo_scan_prompt(olmo_instructions, question, action, volume_info,
+                            num_frames, frame_spacing, total_dist):
+    """Build Molmo2 scan interpretation prompt with OLMo-crafted instructions."""
+    layout = action.get("layout", "xy")
+    zoom = action.get("zoom", "full")
+    scan_axis = action.get("scan_type", "z_sweep").replace("_sweep", "").replace("_pan", "")
+    start, end = action.get("start", {}), action.get("end", {})
+    return (
+        f"{olmo_instructions}\n\n---\n\n"
+        f"Question: \"{question}\"\n\n"
+        f"Scan: {num_frames} frames along {scan_axis}, "
+        f"({start.get('x',0):.0f},{start.get('y',0):.0f},{start.get('z',0):.0f}) → "
+        f"({end.get('x',0):.0f},{end.get('y',0):.0f},{end.get('z',0):.0f})\n"
+        f"Frame spacing: ~{frame_spacing:.1f}µm, total distance: {total_dist:.0f}µm\n"
+        f"Layout: {layout}, zoom: {zoom}\n\n"
+        f"Describe what you observe across the frames:\n"
+        f"- How does the content change along the scan axis?\n"
+        f"- Where are structures most dense vs sparse?\n"
+        f"- Are there boundaries, transitions, or abrupt changes?\n"
+        f"- Estimate the spatial extent of notable features"
+    )
+
+
+def build_reasoning_prompt(question, finding, findings_text, iteration,
+                           fov_feedback=""):
+    """Step 6: OLMo post-finding reasoning."""
+    finding_block = finding
+    if fov_feedback:
+        finding_block += f"\n{fov_feedback}"
+    return (
+        f"QUESTION: \"{question}\"\n\n"
+        f"NEW FINDING (iteration {iteration}):\n{finding_block}\n\n"
+        f"INVESTIGATION SO FAR:\n{findings_text}\n\n"
+        f"Analyze the new finding in context of your prior investigation:\n\n"
+        f"1. Does this finding confirm, contradict, or extend previous findings?\n"
+        f"2. What spatial regions remain unexplored?\n"
+        f"3. Do you have sufficient evidence to answer the question confidently?\n\n"
+        f"If you have enough evidence, respond with your answer:\n"
+        f'{{\"action\": \"answer\", \"answer\": \"...\"}}\n\n'
+        f"Otherwise, summarize your current understanding and what remains uncertain."
+    )
+
+
+def build_count_reasoning_prompt(question, target, pointing_stats, findings_text,
+                                 iteration):
+    """Step 6 count variant: OLMo interprets pointing statistics."""
+    return (
+        f"QUESTION: \"{question}\"\n\n"
+        f"COUNT RESULTS (iteration {iteration}):\nTarget: \"{target}\"\n"
+        f"{pointing_stats}\n\n"
+        f"INVESTIGATION SO FAR:\n{findings_text}\n\n"
+        f"Interpret these detection results:\n"
+        f"- Account for double-counting (objects spanning multiple z-slices)\n"
+        f"- Keyframe spacing vs object size: if spacing < diameter, expect overcounting\n"
+        f"- Detection confidence: low-contrast or partial objects may be missed\n\n"
+        f"Then decide: enough evidence to answer, or need more investigation?\n\n"
+        f"If you have enough evidence, respond with your answer:\n"
+        f'{{\"action\": \"answer\", \"answer\": \"...\"}}'
+    )
+
+
+def build_reason_shortcircuit_prompt(question, reason_question, findings_text):
+    """Step 6 variant for explicit reason action (short-circuit from step 2)."""
+    return (
+        f"QUESTION: \"{question}\"\n\n"
+        f"INVESTIGATION SO FAR:\n{findings_text}\n\n"
+        f"Your reasoning request: \"{reason_question}\"\n\n"
+        f"Analyze the evidence and decide your next step:\n"
+        f"1. If evidence is sufficient, provide your answer.\n"
+        f"2. If findings conflict, identify the contradiction.\n"
+        f"3. If critical regions remain unexplored, describe what to investigate next."
+    )
+
+# ── Agent Loop (v4 — 6-step iteration) ─────────────────────────────────────────
+
+def run_agent(manager, config: dict, ng_link: str, question: str):
+    """Run the v4 agent loop with OLMo reasoning + Molmo vision.
+
+    6-step iteration:
+        1. OLMo: investigation plan (natural language)
+        2. OLMo: action decision (strict JSON from schema)
+        3. OLMo: vision instructions for Molmo2
+        4. System: capture view (screenshot / scan / count frames)
+        5. Molmo2: interpret the captured view
+        6. OLMo: reasoning over finding → continue or answer
+
+    Steps 1-3 and 6 run on OLMo (one swap_to_olmo call stays active).
+    Steps 4-5 run on Molmo2 (swap_to_molmo).
+    Short-circuit: if step 2 outputs reason or answer, steps 3-5 are skipped.
+    """
     from neuroglancer_state import NeuroglancerState
     from playwright.sync_api import sync_playwright
 
@@ -638,11 +863,14 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
             if note:
                 f.write(f"_{note}_\n\n")
             if tokens:
-                f.write(f"**Tokens:** {tokens['input_tokens']} in / {tokens['output_tokens']} out\n\n")
+                tok_str = f"{tokens['input_tokens']} in / {tokens['output_tokens']} out"
+                if "think_tokens" in tokens:
+                    tok_str += f" ({tokens['think_tokens']} think)"
+                f.write(f"**Tokens:** {tok_str}\n\n")
             f.write(f"### Prompt\n\n```\n{prompt}\n```\n\n")
             f.write(f"### Response\n\n```\n{response}\n```\n\n")
 
-    # ── Parse NG state and discover volume ──────────────────────────────
+    # ── Parse NG state and discover volume ──────────────────────────
     print("\n[Setup] Parsing NG link and discovering volume metadata ...")
     base_state = NeuroglancerState.from_url(ng_link)
     volume_info = discover_volume(base_state.data)
@@ -651,14 +879,23 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
     save_prompt_templates(volume_info, config, question)
 
     # ── Token tracking ──────────────────────────────────────────────────
-    token_usage = {"iterations": [], "totals": {"input_tokens": 0, "output_tokens": 0}}
+    token_usage = {
+        "iterations": [],
+        "totals": {"input_tokens": 0, "output_tokens": 0},
+        "by_model": {
+            "molmo": {"input_tokens": 0, "output_tokens": 0},
+            "olmo": {"input_tokens": 0, "output_tokens": 0},
+        },
+    }
 
-    def track(iteration, step, tokens):
-        entry = {"iteration": iteration, "step": step, **tokens}
+    def track(iteration, step, tokens, model_name="molmo"):
+        entry = {"iteration": iteration, "step": step, "model": model_name, **tokens}
         token_usage["iterations"].append(entry)
         token_usage["totals"]["input_tokens"] += tokens["input_tokens"]
         token_usage["totals"]["output_tokens"] += tokens["output_tokens"]
-        print(f"    [{tokens['input_tokens']} in / {tokens['output_tokens']} out tokens]")
+        token_usage["by_model"][model_name]["input_tokens"] += tokens["input_tokens"]
+        token_usage["by_model"][model_name]["output_tokens"] += tokens["output_tokens"]
+        print(f"    [{model_name}] {tokens['input_tokens']} in / {tokens['output_tokens']} out")
 
     # ── Agent loop state ────────────────────────────────────────────────
     history = []          # list of {iteration, action_data, finding, fov_feedback}
@@ -666,7 +903,7 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
     screenshot_count = 0
     scan_count = 0
     consecutive_duplicates = 0
-    max_consecutive_duplicates = 3  # force answer after this many in a row
+    max_consecutive_duplicates = 3
     final_answer = None
     max_iter = config["max_agent_iterations"]
 
@@ -674,67 +911,48 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
     print(f"  Question: {question}\n")
 
     with sync_playwright() as pw:
-        browser, page = create_browser(pw, config)
+        browser, page = create_browser(pw)
 
-        # ── Phase 1: First Look — "What am I looking at?" ────────────
+        # ── Phase 1: First Look (Molmo2) — "What am I looking at?" ────
         print("[Phase 1] First Look — What am I looking at?")
+        manager.swap_to_molmo()
         screenshot_count += 1
-        cx, cy, cz = volume_info.shape[0] / 2, volume_info.shape[1] / 2, volume_info.shape[2] / 2
+        cx = volume_info.shape[0] / 2
+        cy = volume_info.shape[1] / 2
+        cz = volume_info.shape[2] / 2
         first_look_state = build_clean_state(base_state, {
             "x": cx, "y": cy, "z": cz,
         }, volume_info)
-        first_look_img = capture_screenshot(page, first_look_state, config, screenshot_count)
+        first_look_img = capture_screenshot(page, first_look_state, screenshot_count)
 
         first_look_prompt = (
             f"This is a Neuroglancer view of a 3D volume "
-            f"({volume_info.shape[0]}×{volume_info.shape[1]}×{volume_info.shape[2]} voxels).\n"
+            f"({volume_info.shape[0]}\u00d7{volume_info.shape[1]}\u00d7{volume_info.shape[2]} voxels).\n"
             f"{volume_info.format_for_prompt()}\n\n"
             f"Describe what you see: what kind of data, what structures are visible, "
             f"how dense or sparse is the content?"
         )
         first_look_finding, tokens = ask_vision(
-            model, processor, first_look_img, first_look_prompt,
-            max_new_tokens=512, config=config,
+            manager.molmo_model, manager.molmo_processor,
+            first_look_img, first_look_prompt, max_new_tokens=512,
         )
-        track(0, "first_look", tokens)
-        log_exchange(0, "first_look", first_look_prompt, first_look_finding, tokens, "image: view_001.png")
+        track(0, "first_look", tokens, "molmo")
+        log_exchange(0, "first_look", first_look_prompt, first_look_finding,
+                     tokens, "image: view_001.png")
         print(f"  First look: {first_look_finding[:300]}...")
 
         history.append({
             "iteration": 0,
-            "action_data": {"action": "screenshot", "view": {"layout": base_state.data.get("layout", "4panel")},
-                            "prompt": "Phase 1: What am I looking at?"},
+            "action_data": {
+                "action": "screenshot",
+                "view": {"layout": base_state.data.get("layout", "4panel")},
+                "prompt": "Phase 1: What am I looking at?",
+            },
             "finding": first_look_finding,
             "fov_feedback": "[user's original view — default zoom and position]",
         })
 
-        # ── Phase 2: Plan — "What views should I examine?" ──────────
-        print("\n[Phase 2] Planning — What views should I examine?")
-        plan_prompt = (
-            f"You examined a 3D volume and described it as:\n"
-            f"\"{first_look_finding}\"\n\n"
-            f"Question: \"{question}\"\n"
-            f"Volume: {volume_info.format_for_prompt()}\n\n"
-            f"You can take screenshots (2D cross-sections), video scans (sweeps along an axis), "
-            f"and counting scans (pointing to specific objects across keyframes).\n\n"
-            f"What strategy should you use to answer this question? "
-            f"Think about what regions to examine, what to look for, "
-            f"and whether counting or scanning would be most useful. "
-            f"Respond in plain text, not JSON."
-        )
-        plan_response, tokens = ask_text(model, processor, plan_prompt, max_new_tokens=512)
-        track(0, "plan", tokens)
-        log_exchange(0, "plan", plan_prompt, plan_response, tokens)
-        print(f"  Plan: {plan_response[:400]}...")
-
-        history.append({
-            "iteration": 0,
-            "action_data": {"action": "reason", "question": "Plan strategy"},
-            "finding": plan_response,
-            "fov_feedback": "",
-        })
-
-        # ── Agent loop ──────────────────────────────────────────────────
+        # ── 6-step agent loop ────────────────────────────────────────
         for iteration in range(1, max_iter + 1):
             print(f"\n{'='*60}")
             print(f"  Iteration {iteration}/{max_iter}")
@@ -742,307 +960,69 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
             print(f"  VRAM: {vram['allocated']:.1f} / {vram['total']:.1f} GB")
             print(f"{'='*60}")
 
-            # ── Build decision prompt ───────────────────────────────────
-            forced = (iteration == max_iter) or (consecutive_duplicates >= max_consecutive_duplicates)
-            if forced and consecutive_duplicates >= max_consecutive_duplicates:
-                print("  [Forced] Too many repeated actions — requiring answer now.")
-            prompt = build_decision_prompt(
-                question, volume_info, history, config, iteration, forced_answer=forced,
+            findings_text = format_structured_findings(history)
+
+            # ── Step 1: OLMo investigation plan ──────────────────────
+            manager.swap_to_olmo()
+            print("\n  [Step 1] OLMo: Investigation plan ...")
+            plan_prompt = build_plan_prompt(
+                question, volume_info, first_look_finding, findings_text,
+                iteration, max_iter,
             )
+            plan_text, tokens, _ = ask_text_olmo(
+                manager, OLMO_SYSTEM_PROMPT, plan_prompt,
+                max_new_tokens=config["olmo_max_new_tokens_plan"],
+                sampling=config["olmo_sampling_structured"],
+            )
+            track(iteration, "plan", tokens, "olmo")
+            log_exchange(iteration, "step1_plan", plan_prompt, plan_text, tokens)
+            print(f"  Plan: {plan_text[:300]}...")
 
-            # ── Ask model for next action ───────────────────────────────
-            print("\n  [Decision] Asking model for next action ...")
-            decision_text, tokens = ask_text(model, processor, prompt, max_new_tokens=512)
-            track(iteration, "decision", tokens)
-            log_exchange(iteration, "decision", prompt, decision_text, tokens)
-            print(f"  Model output: {decision_text[:200]}...")
+            # ── Step 2: OLMo action decision (strict JSON) ──────────
+            print("\n  [Step 2] OLMo: Action decision ...")
+            action_prompt = build_action_prompt(plan_text, volume_info, config)
+            action_text, tokens, _ = ask_text_olmo(
+                manager, OLMO_SYSTEM_PROMPT, action_prompt,
+                max_new_tokens=config["olmo_max_new_tokens_decision"],
+                sampling=config["olmo_sampling_structured"],
+            )
+            track(iteration, "action", tokens, "olmo")
+            log_exchange(iteration, "step2_action", action_prompt, action_text, tokens)
+            print(f"  Action text: {action_text[:200]}...")
 
-            # ── Parse action ────────────────────────────────────────────
-            action = parse_action(decision_text)
+            # Parse JSON action
+            action = parse_action(action_text)
             if action is None:
-                # Retry once with format reminder
-                print("  WARNING: Could not parse action JSON. Retrying with format reminder ...")
+                print("  WARNING: Could not parse action JSON. Retrying ...")
                 retry_prompt = (
-                    prompt + "\n\nYour previous response was not valid JSON. "
-                    "Please respond with ONLY a JSON object like: "
-                    '{"action": "screenshot", "view": {"x": 100, "y": 100, "z": 100, "layout": "xy", "crossSectionScale": 1.0}, "prompt": "describe what you see"}'
+                    action_prompt
+                    + "\n\nYour previous response was not valid JSON. "
+                    "Please respond with ONLY a JSON object."
                 )
-                decision_text, tokens = ask_text(model, processor, retry_prompt, max_new_tokens=512)
-                track(iteration, "decision_retry", tokens)
-                log_exchange(iteration, "decision_retry", retry_prompt, decision_text, tokens)
-                action = parse_action(decision_text)
+                action_text, tokens, _ = ask_text_olmo(
+                    manager, OLMO_SYSTEM_PROMPT, retry_prompt,
+                    max_new_tokens=config["olmo_max_new_tokens_retry"],
+                    sampling=config["olmo_sampling_retry"],
+                )
+                track(iteration, "action_retry", tokens, "olmo")
+                log_exchange(iteration, "step2_retry", retry_prompt, action_text, tokens)
+                action = parse_action(action_text)
 
             if action is None:
-                print("  ERROR: Failed to parse action after retry. Forcing reason action.")
-                action = {"action": "reason", "question": f"Failed to produce valid JSON: {decision_text[:200]}"}
+                print("  ERROR: Failed to parse after retry. Forcing reason.")
+                action = {
+                    "action": "reason",
+                    "question": f"JSON parse failed: {action_text[:200]}",
+                }
 
             action = validate_action(action, volume_info)
             action_type = action.get("action", "unknown")
             print(f"\n  [Action] {action_type}")
 
-            # ── Duplicate check — allow up to 2, then force reason ──────
-            prior_count = count_prior_matches(action, history)
-            if prior_count >= 2:
-                consecutive_duplicates += 1
-                print(f"  BLOCKED: action done {prior_count} times already — forcing reason step")
-
-                reason_prompt = (
-                    f"The user's question is: \"{question}\"\n\n"
-                    f"You just tried to repeat an action you've already done {prior_count} times. "
-                    f"Step back and think: what have you learned so far?\n\n"
-                    f"Your findings so far:\n"
-                )
-                for entry in history:
-                    f = entry.get("finding", "")
-                    if f and not f.startswith("["):
-                        reason_prompt += f"- {f[:300]}\n"
-                reason_prompt += (
-                    f"\nBased on these findings, what should you do DIFFERENTLY next? "
-                    f"Consider: different position, zoom, layout, layer visibility, axis, "
-                    f"or a different action type entirely. "
-                    f"If you have enough information, your next action should be 'answer'."
-                )
-
-                finding, tokens = ask_text(
-                    model, processor, reason_prompt, max_new_tokens=512,
-                )
-                track(iteration, "forced_reason", tokens)
-                log_exchange(iteration, "forced_reason", reason_prompt, finding, tokens)
-                print(f"  Forced reasoning: {finding[:200]}...")
-
-                history.append({
-                    "iteration": iteration,
-                    "action_data": {"action": "reason", "question": "[forced — repeated action blocked]"},
-                    "finding": finding,
-                    "fov_feedback": "",
-                })
-                continue
-            else:
-                consecutive_duplicates = 0
-
-            # ── Execute action ──────────────────────────────────────────
-            finding = ""
-            fov_feedback = ""
-
-            if action_type == "screenshot":
-                view_spec = action.get("view", {})
-                user_prompt = action.get("prompt", "Describe what you see in this view.")
-                screenshot_count += 1
-                state = build_clean_state(base_state, view_spec, volume_info)
-                img = capture_screenshot(page, state, config, screenshot_count)
-
-                interpret_prompt = (
-                    f"Question: \"{question}\"\n\n"
-                    f"{user_prompt}\n"
-                    f"Describe what you see. Give counts or measurements where possible. "
-                    f"What does this tell you about the question?"
-                )
-
-                # Model interprets the screenshot
-                print(f"  [Interpret] {user_prompt[:80]}...")
-                finding, tokens = ask_vision(
-                    model, processor, img, interpret_prompt,
-                    max_new_tokens=1024, config=config,
-                )
-                track(iteration, "interpret", tokens)
-                log_exchange(iteration, "interpret_screenshot", interpret_prompt, finding, tokens,
-                             f"image: view_{screenshot_count:03d}.png")
-                print(f"  Finding: {finding[:200]}...")
-
-                # FOV feedback
-                pos = [view_spec.get("x", 0), view_spec.get("y", 0), view_spec.get("z", 0)]
-                scale = view_spec.get("crossSectionScale", 1.0)
-                layout = view_spec.get("layout", "xy")
-                fov_feedback = format_fov_feedback(pos, scale, layout, volume_info)
-                print(f"  {fov_feedback}")
-
-            elif action_type == "scan":
-                scan_count += 1
-                user_prompt = action.get("prompt", "Describe what you observe in this scan.")
-
-                geo_fp = _geometry_fingerprint(action)
-                if geo_fp in frame_cache:
-                    frames = frame_cache[geo_fp]
-                    print(f"  [Cache hit] Reusing {len(frames)} frames from prior scan")
-                    save_scan_video(frames, scan_count)
-                else:
-                    frames = execute_scan(base_state, action, volume_info, config, scan_count)
-                    if geo_fp:
-                        frame_cache[geo_fp] = frames
-
-                # Compute inter-frame spacing for spatial context
-                scan_start = action.get("start", {})
-                scan_end = action.get("end", {})
-                cx, cy, cz = volume_info.shape[0]/2, volume_info.shape[1]/2, volume_info.shape[2]/2
-                s = np.array([scan_start.get("x", cx), scan_start.get("y", cy), scan_start.get("z", cz)])
-                e = np.array([scan_end.get("x", cx), scan_end.get("y", cy), scan_end.get("z", cz)])
-                total_dist = float(np.linalg.norm(e - s))
-                frame_spacing = total_dist / max(len(frames) - 1, 1)
-                scan_axis = action.get("scan_type", "z_sweep").replace("_sweep", "").replace("_pan", "")
-
-                interpret_prompt = (
-                    f"Question: \"{question}\"\n\n"
-                    f"{user_prompt}\n"
-                    f"Scan: {len(frames)} frames along {scan_axis}, "
-                    f"~{frame_spacing:.1f}µm between frames, "
-                    f"{total_dist:.0f}µm total.\n"
-                    f"Describe what you see across the frames. "
-                    f"Give counts or estimates where possible. "
-                    f"What does this tell you about the question?"
-                )
-
-                # Model interprets the scan frames
-                print(f"  [Interpret scan] {len(frames)} frames, {user_prompt[:80]}...")
-                finding, tokens = ask_scan(
-                    model, processor, frames, interpret_prompt,
-                    max_new_tokens=1024, config=config,
-                )
-                track(iteration, "interpret_scan", tokens)
-                log_exchange(iteration, "interpret_scan", interpret_prompt, finding, tokens,
-                             f"video: scan_{scan_count:03d}.mp4, {len(frames)} frames")
-                print(f"  Finding: {finding[:200]}...")
-
-            elif action_type == "count":
-                scan_count += 1
-                target = action.get("target", "objects")
-
-                geo_fp = _geometry_fingerprint(action)
-                if geo_fp in frame_cache:
-                    frames = frame_cache[geo_fp]
-                    print(f"  [Cache hit] Reusing {len(frames)} frames from prior scan")
-                    save_scan_video(frames, scan_count)
-                else:
-                    frames = execute_scan(base_state, action, volume_info, config, scan_count)
-                    if geo_fp:
-                        frame_cache[geo_fp] = frames
-
-                # Step 1: Per-keyframe image pointing
-                keyframe_interval = max(1, int(action.get("keyframe_interval", 5)))
-                keyframe_indices = list(range(0, len(frames), keyframe_interval))
-                print(f"  [Count] Pointing to '{target}' on {len(keyframe_indices)} keyframes "
-                      f"(every {keyframe_interval} of {len(frames)} frames) ...")
-
-                points = []  # (frame_idx, x, y) tuples
-                total_point_tokens = {"input_tokens": 0, "output_tokens": 0}
-
-                # Compute pixel size for pointing context
-                scale = action.get("crossSectionScale",
-                                   max(volume_info.shape[0], volume_info.shape[1]) / 1024)
-                fov_um = scale * 1024
-                neuron_pixels = int(30.0 / (fov_um / 1024))
-                point_prompt = (
-                    f"Point to the {target}. "
-                    f"Each {target.rstrip('s')} is approximately {neuron_pixels} pixels across."
-                )
-
-                for ki in keyframe_indices:
-                    _, frame_points, tokens = ask_vision_pointing(
-                        model, processor, frames[ki], point_prompt,
-                        max_new_tokens=2048, config=config,
-                    )
-                    total_point_tokens["input_tokens"] += tokens["input_tokens"]
-                    total_point_tokens["output_tokens"] += tokens["output_tokens"]
-                    for x, y in frame_points:
-                        points.append((float(ki), x, y))
-                    print(f"    keyframe {ki}: {len(frame_points)} points")
-
-                track(iteration, "count_point", total_point_tokens)
-                # Log pointing summary (individual keyframe outputs are structured coords, not prose)
-                pointing_summary = "\n".join(
-                    f"  keyframe {ki}: {sum(1 for p in points if int(p[0]) == ki)} points"
-                    for ki in keyframe_indices
-                )
-                log_exchange(iteration, "count_point", point_prompt, pointing_summary,
-                             total_point_tokens,
-                             f"video: scan_{scan_count:03d}.mp4, {len(keyframe_indices)} keyframes")
-                print(f"  Pointing total: {len(points)} points across {len(keyframe_indices)} keyframes")
-
-                # Save annotated video with point markers
-                if points:
-                    annotate_scan_frames(frames, points, scan_count)
-
-                # Step 2: Ask text model to interpret the count result
-                scan_start = action.get("start", {})
-                scan_end = action.get("end", {})
-                cx, cy, cz = volume_info.shape[0]/2, volume_info.shape[1]/2, volume_info.shape[2]/2
-                s = np.array([scan_start.get("x", cx), scan_start.get("y", cy), scan_start.get("z", cz)])
-                e = np.array([scan_end.get("x", cx), scan_end.get("y", cy), scan_end.get("z", cz)])
-                total_dist = float(np.linalg.norm(e - s))
-                frame_spacing = total_dist / max(len(frames) - 1, 1)
-                scan_axis = action.get("scan_type", "z_sweep").replace("_sweep", "").replace("_pan", "")
-
-                # Summarize point distribution across keyframes
-                frame_ids = sorted(set(int(p[0]) for p in points)) if points else []
-                points_per_frame = {}
-                for p in points:
-                    fid = int(p[0])
-                    points_per_frame[fid] = points_per_frame.get(fid, 0) + 1
-
-                keyframe_spacing = keyframe_interval * frame_spacing
-                interpret_prompt = (
-                    f"The user's question is: \"{question}\"\n\n"
-                    f"You pointed to {target} in {len(keyframe_indices)} keyframes sampled "
-                    f"every {keyframe_interval} frames from a {scan_axis} sweep of {len(frames)} frames "
-                    f"(~{frame_spacing:.1f}µm between frames, ~{keyframe_spacing:.1f}µm between keyframes, "
-                    f"{total_dist:.0f}µm total).\n"
-                    f"Found {len(points)} points across {len(frame_ids)} of "
-                    f"{len(keyframe_indices)} sampled keyframes.\n"
-                )
-                if points_per_frame:
-                    counts = sorted(points_per_frame.values())
-                    interpret_prompt += (
-                        f"Points per keyframe: min={counts[0]}, max={counts[-1]}, "
-                        f"median={counts[len(counts)//2]}.\n"
-                    )
-                interpret_prompt += (
-                    f"\nThese are automated pixel-level detections. "
-                    f"The same {target} may appear in adjacent keyframes "
-                    f"(keyframe spacing ~{keyframe_spacing:.1f}µm). "
-                    f"Report the estimated number of unique {target} detected in this scan. "
-                    f"Do NOT extrapolate to the full volume — just report what was detected."
-                )
-
-                print(f"  [Interpret count] ...")
-                count_finding, tokens = ask_text(
-                    model, processor, interpret_prompt, max_new_tokens=512,
-                )
-                track(iteration, "count_interpret", tokens)
-                log_exchange(iteration, "count_interpret", interpret_prompt, count_finding, tokens)
-
-                finding = (
-                    f"DETECTED (automated pointing): {len(points)} instances of '{target}' "
-                    f"across {len(frame_ids)}/{len(keyframe_indices)} keyframes "
-                    f"(from {len(frames)} total frames). "
-                    f"This is a grounded count — trust it over visual estimates. "
-                    f"{count_finding}"
-                )
-                print(f"  Finding: {finding[:200]}...")
-
-            elif action_type == "reason":
-                reason_question = action.get("question", "Synthesize findings so far.")
-                reason_prompt = (
-                    f"The user's question is: \"{question}\"\n\n"
-                    f"Your findings so far:\n"
-                )
-                for entry in history:
-                    f = entry.get("finding", "")
-                    if f and not f.startswith("["):
-                        reason_prompt += f"- {f[:300]}\n"
-                reason_prompt += f"\n{reason_question}"
-
-                print(f"  [Reason] {reason_question[:80]}...")
-                finding, tokens = ask_text(
-                    model, processor, reason_prompt, max_new_tokens=1024,
-                )
-                track(iteration, "reason", tokens)
-                log_exchange(iteration, "reason", reason_prompt, finding, tokens)
-                print(f"  Reasoning: {finding[:200]}...")
-
-            elif action_type == "answer":
+            # ── Short-circuit: answer ────────────────────────────────
+            if action_type == "answer":
                 final_answer = action.get("answer", "")
                 print(f"\n  [ANSWER] {final_answer}")
-
-                # Save and break
                 history.append({
                     "iteration": iteration,
                     "action_data": action,
@@ -1051,11 +1031,341 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
                 })
                 break
 
-            else:
-                print(f"  WARNING: Unknown action type '{action_type}'. Treating as reason.")
-                finding = f"Unknown action: {action_type}"
+            # ── Short-circuit: reason (skip steps 3-5) ───────────────
+            if action_type == "reason":
+                reason_q = action.get("question", "Synthesize findings.")
+                print("  [Short-circuit] reason — skipping steps 3-5")
+                reason_prompt = build_reason_shortcircuit_prompt(
+                    question, reason_q, findings_text,
+                )
+                finding, tokens, _ = ask_text_olmo(
+                    manager, OLMO_SYSTEM_PROMPT, reason_prompt,
+                    max_new_tokens=config["olmo_max_new_tokens_reasoning"],
+                    sampling=config["olmo_sampling_structured"],
+                )
+                track(iteration, "reason_shortcircuit", tokens, "olmo")
+                log_exchange(iteration, "reason_shortcircuit", reason_prompt,
+                             finding, tokens)
+                print(f"  Reasoning: {finding[:200]}...")
 
-            # ── Append to history ───────────────────────────────────────
+                # Check if OLMo decided to answer within reasoning
+                embedded = parse_action(finding)
+                if embedded and embedded.get("action") == "answer":
+                    final_answer = embedded.get("answer", finding)
+                    print(f"\n  [ANSWER from reasoning] {final_answer}")
+                    history.append({
+                        "iteration": iteration,
+                        "action_data": {"action": "answer", "answer": final_answer},
+                        "finding": final_answer,
+                        "fov_feedback": "",
+                    })
+                    break
+
+                history.append({
+                    "iteration": iteration,
+                    "action_data": action,
+                    "finding": finding,
+                    "fov_feedback": "",
+                })
+                continue
+
+            # ── Duplicate check ─────────────────────────────────────
+            prior_count = count_prior_matches(action, history)
+            if prior_count >= 2:
+                consecutive_duplicates += 1
+                print(f"  BLOCKED: action done {prior_count} times — forcing reason")
+                if consecutive_duplicates >= max_consecutive_duplicates:
+                    print("  [Forced] Too many duplicates — will force answer.")
+
+                dup_prompt = (
+                    f"QUESTION: \"{question}\"\n\n"
+                    f"INVESTIGATION SO FAR:\n{findings_text}\n\n"
+                    f"You just tried to repeat an action done {prior_count} times.\n"
+                    f"What should you do DIFFERENTLY, or do you have enough "
+                    f"evidence to answer?"
+                )
+                finding, tokens, _ = ask_text_olmo(
+                    manager, OLMO_SYSTEM_PROMPT, dup_prompt,
+                    max_new_tokens=config["olmo_max_new_tokens_reasoning"],
+                    sampling=config["olmo_sampling_structured"],
+                )
+                track(iteration, "forced_reason", tokens, "olmo")
+                log_exchange(iteration, "forced_reason", dup_prompt, finding, tokens)
+                print(f"  Forced reasoning: {finding[:200]}...")
+
+                history.append({
+                    "iteration": iteration,
+                    "action_data": {"action": "reason",
+                                    "question": "[forced — repeated action blocked]"},
+                    "finding": finding,
+                    "fov_feedback": "",
+                })
+                continue
+            else:
+                consecutive_duplicates = 0
+
+            # ── Step 3: OLMo vision instructions for Molmo2 ─────────
+            print("\n  [Step 3] OLMo: Vision instructions ...")
+            instr_prompt = build_vision_instructions_prompt(
+                action, question, findings_text,
+            )
+            olmo_instructions, tokens, _ = ask_text_olmo(
+                manager, OLMO_SYSTEM_PROMPT, instr_prompt,
+                max_new_tokens=config["olmo_max_new_tokens_vision_instr"],
+                sampling=config["olmo_sampling_structured"],
+            )
+            track(iteration, "vision_instructions", tokens, "olmo")
+            log_exchange(iteration, "step3_vision_instr", instr_prompt,
+                         olmo_instructions, tokens)
+            print(f"  Instructions: {olmo_instructions[:200]}...")
+
+            # ── Steps 4-5: Molmo2 capture + interpret ────────────────
+            manager.swap_to_molmo()
+            finding = ""
+            fov_feedback = ""
+
+            if action_type == "screenshot":
+                # Step 4: Capture screenshot
+                view_spec = action.get("view", {})
+                screenshot_count += 1
+                state = build_clean_state(base_state, view_spec, volume_info)
+                img = capture_screenshot(page, state, screenshot_count)
+
+                # Step 5: Molmo2 interprets
+                interpret_prompt = build_molmo_screenshot_prompt(
+                    olmo_instructions, question, action, volume_info,
+                )
+                print(f"  [Step 5] Molmo2: Interpreting screenshot ...")
+                finding, tokens = ask_vision(
+                    manager.molmo_model, manager.molmo_processor,
+                    img, interpret_prompt, max_new_tokens=1024,
+                )
+                track(iteration, "interpret_screenshot", tokens, "molmo")
+                log_exchange(iteration, "step5_interpret", interpret_prompt,
+                             finding, tokens,
+                             f"image: view_{screenshot_count:03d}.png")
+                print(f"  Finding: {finding[:200]}...")
+
+                # FOV feedback
+                pos = [view_spec.get("x", 0), view_spec.get("y", 0),
+                       view_spec.get("z", 0)]
+                scale = view_spec.get("crossSectionScale", 1.0)
+                layout = view_spec.get("layout", "xy")
+                fov_feedback = format_fov_feedback(pos, scale, layout, volume_info)
+                print(f"  {fov_feedback}")
+
+            elif action_type == "scan":
+                # Step 4: Capture scan
+                scan_count += 1
+                geo_fp = _geometry_fingerprint(action)
+                if geo_fp in frame_cache:
+                    frames = frame_cache[geo_fp]
+                    print(f"  [Cache hit] Reusing {len(frames)} frames")
+                    save_scan_video(frames, scan_count)
+                else:
+                    frames = execute_scan(base_state, action, volume_info,
+                                          config, scan_count)
+                    if geo_fp:
+                        frame_cache[geo_fp] = frames
+
+                # Compute spatial context
+                scan_start = action.get("start", {})
+                scan_end = action.get("end", {})
+                s = np.array([scan_start.get("x", cx), scan_start.get("y", cy),
+                              scan_start.get("z", cz)])
+                e = np.array([scan_end.get("x", cx), scan_end.get("y", cy),
+                              scan_end.get("z", cz)])
+                total_dist = float(np.linalg.norm(e - s))
+                frame_spacing = total_dist / max(len(frames) - 1, 1)
+
+                # Step 5: Molmo2 interprets scan
+                interpret_prompt = build_molmo_scan_prompt(
+                    olmo_instructions, question, action, volume_info,
+                    len(frames), frame_spacing, total_dist,
+                )
+                print(f"  [Step 5] Molmo2: Interpreting scan "
+                      f"({len(frames)} frames) ...")
+                finding, tokens = ask_scan(
+                    manager.molmo_model, manager.molmo_processor,
+                    frames, interpret_prompt,
+                    max_new_tokens=1024, config=config,
+                )
+                track(iteration, "interpret_scan", tokens, "molmo")
+                log_exchange(iteration, "step5_interpret_scan", interpret_prompt,
+                             finding, tokens,
+                             f"video: scan_{scan_count:03d}.mp4, "
+                             f"{len(frames)} frames")
+                print(f"  Finding: {finding[:200]}...")
+
+            elif action_type == "count":
+                # Step 4: Capture + per-keyframe pointing
+                scan_count += 1
+                target = action.get("target", "objects")
+
+                geo_fp = _geometry_fingerprint(action)
+                if geo_fp in frame_cache:
+                    frames = frame_cache[geo_fp]
+                    print(f"  [Cache hit] Reusing {len(frames)} frames")
+                    save_scan_video(frames, scan_count)
+                else:
+                    frames = execute_scan(base_state, action, volume_info,
+                                          config, scan_count)
+                    if geo_fp:
+                        frame_cache[geo_fp] = frames
+
+                # Step 5: Per-keyframe pointing with OLMo-refined target
+                keyframe_interval = max(1, int(
+                    action.get("keyframe_interval", 5)))
+                keyframe_indices = list(range(0, len(frames),
+                                              keyframe_interval))
+                print(f"  [Step 5] Pointing to '{target}' on "
+                      f"{len(keyframe_indices)} keyframes ...")
+
+                # Use OLMo instructions as refined pointing prompt
+                point_prompt = (olmo_instructions.strip()
+                                if olmo_instructions.strip()
+                                else f"Point to the {target}.")
+
+                points = []
+                total_point_tokens = {"input_tokens": 0, "output_tokens": 0}
+
+                for ki in keyframe_indices:
+                    _, frame_points, tokens = ask_vision_pointing(
+                        manager.molmo_model, manager.molmo_processor,
+                        frames[ki], point_prompt, max_new_tokens=2048,
+                    )
+                    total_point_tokens["input_tokens"] += tokens["input_tokens"]
+                    total_point_tokens["output_tokens"] += tokens["output_tokens"]
+                    for x, y in frame_points:
+                        points.append((float(ki), x, y))
+                    print(f"    keyframe {ki}: {len(frame_points)} points")
+
+                track(iteration, "count_point", total_point_tokens, "molmo")
+                pointing_summary = "\n".join(
+                    f"  keyframe {ki}: "
+                    f"{sum(1 for p in points if int(p[0]) == ki)} points"
+                    for ki in keyframe_indices
+                )
+                log_exchange(iteration, "count_point", point_prompt,
+                             pointing_summary, total_point_tokens,
+                             f"video: scan_{scan_count:03d}.mp4, "
+                             f"{len(keyframe_indices)} keyframes")
+                print(f"  Pointing total: {len(points)} points")
+
+                if points:
+                    annotate_scan_frames(frames, points, scan_count)
+
+                # Build pointing stats for OLMo reasoning (step 6)
+                scan_start = action.get("start", {})
+                scan_end = action.get("end", {})
+                s = np.array([scan_start.get("x", cx), scan_start.get("y", cy),
+                              scan_start.get("z", cz)])
+                e = np.array([scan_end.get("x", cx), scan_end.get("y", cy),
+                              scan_end.get("z", cz)])
+                total_dist = float(np.linalg.norm(e - s))
+                frame_spacing = total_dist / max(len(frames) - 1, 1)
+                scan_axis = action.get("scan_type", "z_sweep").replace(
+                    "_sweep", "").replace("_pan", "")
+
+                frame_ids = sorted(set(int(p[0]) for p in points)) \
+                    if points else []
+                points_per_frame = {}
+                for p in points:
+                    fid = int(p[0])
+                    points_per_frame[fid] = points_per_frame.get(fid, 0) + 1
+
+                keyframe_spacing = keyframe_interval * frame_spacing
+                pointing_stats = (
+                    f"Scan: {len(frames)} frames along {scan_axis}, "
+                    f"~{frame_spacing:.1f}\u00b5m between frames, "
+                    f"~{keyframe_spacing:.1f}\u00b5m between keyframes, "
+                    f"{total_dist:.0f}\u00b5m total.\n"
+                    f"Detected {len(points)} points across "
+                    f"{len(frame_ids)}/{len(keyframe_indices)} keyframes.\n"
+                )
+                if points_per_frame:
+                    counts = sorted(points_per_frame.values())
+                    pointing_stats += (
+                        f"Points per keyframe: min={counts[0]}, "
+                        f"max={counts[-1]}, "
+                        f"median={counts[len(counts)//2]}.\n"
+                    )
+
+                # Convert pixel detections to physical coordinates
+                scale = action.get("crossSectionScale",
+                                   max(volume_info.shape[0],
+                                       volume_info.shape[1]) / 1024)
+                layout = action.get("layout", "xy")
+                phys_points = []
+                if points:
+                    n_frames = max(len(frames) - 1, 1)
+                    for frame_idx, px, py in points:
+                        t = frame_idx / n_frames
+                        center = (
+                            s[0] + t * (e[0] - s[0]),
+                            s[1] + t * (e[1] - s[1]),
+                            s[2] + t * (e[2] - s[2]),
+                        )
+                        phys = pixel_to_physical(
+                            px, py, center, scale, layout)
+                        phys_points.append(phys)
+
+                spatial_summary = summarize_spatial_distribution(
+                    phys_points, volume_info) if phys_points else ""
+                if spatial_summary:
+                    pointing_stats += f"\n{spatial_summary}\n"
+
+                finding = (
+                    f"DETECTED (automated pointing): {len(points)} instances "
+                    f"of '{target}' across {len(frame_ids)}/"
+                    f"{len(keyframe_indices)} keyframes "
+                    f"(from {len(frames)} total frames)."
+                )
+
+            # ── Step 6: OLMo reasoning over finding ─────────────────
+            manager.swap_to_olmo()
+            print(f"\n  [Step 6] OLMo: Reasoning over finding ...")
+
+            if action_type == "count":
+                reasoning_prompt = build_count_reasoning_prompt(
+                    question, target, pointing_stats, findings_text,
+                    iteration,
+                )
+            else:
+                reasoning_prompt = build_reasoning_prompt(
+                    question, finding, findings_text, iteration,
+                    fov_feedback=fov_feedback,
+                )
+
+            reasoning_text, tokens, _ = ask_text_olmo(
+                manager, OLMO_SYSTEM_PROMPT, reasoning_prompt,
+                max_new_tokens=config["olmo_max_new_tokens_reasoning"],
+                sampling=config["olmo_sampling_structured"],
+            )
+            track(iteration, "reasoning", tokens, "olmo")
+            log_exchange(iteration, "step6_reasoning", reasoning_prompt,
+                         reasoning_text, tokens)
+            print(f"  Reasoning: {reasoning_text[:200]}...")
+
+            # Append OLMo interpretation to count findings
+            if action_type == "count":
+                finding += f" {reasoning_text}"
+
+            # Check if OLMo decided to answer in step 6
+            embedded = parse_action(reasoning_text)
+            if embedded and embedded.get("action") == "answer":
+                final_answer = embedded.get("answer", reasoning_text)
+                print(f"\n  [ANSWER from step 6] {final_answer}")
+                history.append({
+                    "iteration": iteration,
+                    "action_data": {"action": "answer",
+                                    "answer": final_answer},
+                    "finding": final_answer,
+                    "fov_feedback": fov_feedback,
+                })
+                break
+
+            # ── Append finding to history ───────────────────────────
             history.append({
                 "iteration": iteration,
                 "action_data": action,
@@ -1065,16 +1375,28 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
 
         browser.close()
 
-    # ── If loop ended without answer, force one ─────────────────────────
+    # ── If loop ended without answer, force one via OLMo ─────────────
     if final_answer is None:
-        print("\n  [Forced Answer] Max iterations reached, synthesizing from findings ...")
-        synth_prompt = build_decision_prompt(
-            question, volume_info, history, config,
-            iteration=max_iter, forced_answer=True,
+        print("\n  [Forced Answer] Max iterations — OLMo synthesis ...")
+        manager.swap_to_olmo()
+        findings_text = format_structured_findings(history)
+        synth_prompt = (
+            f"QUESTION: \"{question}\"\n\n"
+            f"INVESTIGATION COMPLETE \u2014 ALL FINDINGS:\n{findings_text}\n\n"
+            f"You have reached the maximum number of iterations.\n"
+            f"Synthesize ALL findings into a comprehensive answer.\n"
+            f"Be specific: include counts, spatial descriptions, "
+            f"and confidence level."
         )
-        answer_text, tokens = ask_text(model, processor, synth_prompt, max_new_tokens=2048)
-        track(max_iter, "forced_answer", tokens)
-        log_exchange(max_iter, "forced_answer", synth_prompt, answer_text, tokens)
+        answer_text, tokens, _ = ask_text_olmo(
+            manager, OLMO_SYSTEM_PROMPT, synth_prompt,
+            max_new_tokens=config["olmo_max_new_tokens_synthesis"],
+            sampling=config["olmo_sampling_synthesis"],
+        )
+        track(max_iter, "forced_answer", tokens, "olmo")
+        log_exchange(max_iter, "forced_answer", synth_prompt,
+                     answer_text, tokens)
+
         forced_action = parse_action(answer_text)
         if forced_action and "answer" in forced_action:
             final_answer = forced_action["answer"]
@@ -1088,145 +1410,168 @@ def run_agent(model, processor, config: dict, ng_link: str, question: str):
     return final_answer
 
 
+
 # ── Output Saving ───────────────────────────────────────────────────────────
 
 def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     """Save all prompt templates to results/prompts.md for inspection."""
     from volume_info import format_zoom_table
 
-    cx, cy, cz = volume_info.shape[0] / 2, volume_info.shape[1] / 2, volume_info.shape[2] / 2
-
     md = []
-    md.append("# molmo-glancer — Prompt Templates\n")
+    md.append("# molmo-glancer v4 — Prompt Templates\n")
     md.append(f"Generated for question: *{question}*\n")
     md.append(f"Volume: {volume_info.format_for_prompt()}\n")
 
+    # OLMo system prompt
     md.append("---\n")
-    md.append("## 1. First Look (image + text)\n")
+    md.append("## OLMo System Prompt\n")
+    md.append("Sent as system role in every OLMo call (steps 1, 2, 3, 6).\n")
+    md.append("```")
+    md.append(OLMO_SYSTEM_PROMPT)
+    md.append("```\n")
+
+    # Phase 1: First Look (Molmo2)
+    md.append("---\n")
+    md.append("## Phase 1: First Look (Molmo2, image + text)\n")
     md.append("Sent with a center-position screenshot.\n")
     md.append("```")
     md.append(
         f"This is a Neuroglancer view of a 3D volume "
-        f"({volume_info.shape[0]}×{volume_info.shape[1]}×{volume_info.shape[2]} voxels).\n"
+        f"({volume_info.shape[0]:.0f}\u00d7{volume_info.shape[1]:.0f}"
+        f"\u00d7{volume_info.shape[2]:.0f} \u00b5m).\n"
         f"{volume_info.format_for_prompt()}\n\n"
         f"Describe what you see: what kind of data, what structures are visible, "
         f"how dense or sparse is the content?"
     )
     md.append("```\n")
 
+    # Step 1: Investigation Plan (OLMo)
     md.append("---\n")
-    md.append("## 2. Plan (text-only)\n")
-    md.append("Sent after first look, asks for strategy.\n")
-    md.append("```")
+    md.append("## Step 1: Investigation Plan (OLMo, text-only)\n")
+    md.append(f"Token budget: {config['olmo_max_new_tokens_plan']}\n")
+    md.append("### Iteration 1 variant:\n```")
     md.append(
-        f'You examined a 3D volume and described it as:\n'
-        f'"{{first_look_finding}}"\n\n'
-        f'Question: "{question}"\n'
-        f'Volume: {volume_info.format_for_prompt()}\n\n'
-        f'You can take screenshots (2D cross-sections), video scans (sweeps along an axis), '
-        f'and counting scans (pointing to specific objects across keyframes).\n\n'
-        f'What strategy should you use to answer this question? '
-        f'Think about what regions to examine, what to look for, '
-        f'and whether counting or scanning would be most useful. '
-        f'Respond in plain text, not JSON.'
+        'You have examined a 3D volume and received this initial description:\n'
+        '"{first_look_finding}"\n\n'
+        f'QUESTION: "{question}"\n\n'
+        f'VOLUME:\n{volume_info.format_for_prompt()}\n\n'
+        'Plan your investigation strategy. What should you look at first, and why?'
+    )
+    md.append("```\n### Iteration N variant:\n```")
+    md.append(
+        f'QUESTION: "{question}"\n\n'
+        'INVESTIGATION SO FAR:\n{findings_text}\n\n'
+        'Iteration N/M. What should you investigate next, and why?'
     )
     md.append("```\n")
 
+    # Step 2: Action Decision (OLMo)
     md.append("---\n")
-    md.append("## 3. Decision (text-only)\n")
-    md.append("Sent each iteration. Includes action schema, volume info, and history.\n")
-    md.append("### Action Schema\n")
-    md.append("```")
+    md.append("## Step 2: Action Decision (OLMo, text-only)\n")
+    md.append(f"Token budget: {config['olmo_max_new_tokens_decision']}\n")
+    md.append("### Action Schema:\n```")
     md.append(build_action_schema(volume_info, config["max_scan_frames"]))
+    md.append("```\n### Wrapper:\n```")
+    md.append(
+        'YOUR INVESTIGATION PLAN:\n{plan_text}\n\n'
+        '{action_schema}\n\n'
+        'Output the JSON action that executes your plan. '
+        'Include a "purpose" field explaining what you expect to learn.\n\n'
+        'If you already have enough evidence, use the answer action instead.'
+    )
     md.append("```\n")
-    md.append("### Decision Wrapper\n")
-    md.append("The action schema above is wrapped with:\n")
+
+    # Step 3: Vision Instructions (OLMo)
+    md.append("---\n")
+    md.append("## Step 3: Vision Instructions (OLMo, text-only)\n")
+    md.append(f"Token budget: {config['olmo_max_new_tokens_vision_instr']}\n")
+    md.append("### Screenshot/scan variant:\n```")
+    md.append(
+        'You have planned this view:\n{action_json}\n\n'
+        'PURPOSE: {purpose}\nQUESTION: "{question}"\n\n'
+        'RECENT FINDINGS:\n{last_findings}\n\n'
+        'Write specific instructions for the vision model (2-4 sentences).'
+    )
+    md.append("```\n### Count variant:\n```")
+    md.append(
+        'You have planned a count action:\n{action_json}\n\n'
+        'PURPOSE: {purpose}\nTARGET: "{target}"\n\n'
+        'Refine the target description for the pointing model (1-2 sentences).'
+    )
+    md.append("```\n")
+
+    # Step 5: Molmo2 Interpretation
+    md.append("---\n")
+    md.append("## Step 5: Screenshot Interpret (Molmo2, image + text)\n")
     md.append("```")
     md.append(
-        "You are a visual data analyst. You explore 3D volumetric data "
-        "by taking screenshots and video scans of a Neuroglancer viewer, "
-        "then synthesize an answer.\n\n"
-        "{action_schema}\n\n"
-        "VOLUME INFO:\n  {volume_info}\n\n"
-        "FINDINGS SO FAR (iterations 1-N):\n  {history_entries}\n\n"
-        "QUESTION: {question}\n\n"
-        "Iteration X/Y. What is your next action? Respond with a JSON object."
+        '{olmo_instructions}\n\n---\n\n'
+        f'Question: "{question}"\n\n'
+        'This is a {{layout}} view at position (x, y, z), zoom={{zoom}}.\n'
+        f'{volume_info.format_for_prompt()}\n\n'
+        'Describe what you see. Report structures, counts, distribution.'
     )
     md.append("```\n")
 
     md.append("---\n")
-    md.append("## 4. Forced Answer (text-only)\n")
-    md.append("Sent when max iterations reached or too many duplicates.\n")
+    md.append("## Step 5: Scan Interpret (Molmo2, video + text)\n")
     md.append("```")
     md.append(
-        "YOU MUST ANSWER NOW. This is the final iteration. "
-        "Provide your best answer based on all findings so far.\n"
-        'Respond with: {"action": "answer", "answer": "your answer here"}'
+        '{olmo_instructions}\n\n---\n\n'
+        f'Question: "{question}"\n\n'
+        'Scan: {{num_frames}} frames along {{axis}}, ~{{spacing}}\u00b5m between frames.\n'
+        'Describe what you observe across the frames.'
     )
     md.append("```\n")
 
     md.append("---\n")
-    md.append("## 5. Screenshot Interpret (image + text)\n")
-    md.append("Sent with the captured screenshot image.\n")
+    md.append("## Step 5: Count Pointing (Molmo2, image + text)\n")
+    md.append("OLMo-refined target description sent per keyframe.\n")
     md.append("```")
+    md.append("{olmo_refined_target_description}")
+    md.append("```\n")
+
+    # Step 6: OLMo Reasoning
+    md.append("---\n")
+    md.append("## Step 6: Reasoning (OLMo, text-only)\n")
+    md.append(f"Token budget: {config['olmo_max_new_tokens_reasoning']}\n")
+    md.append("### Screenshot/scan variant:\n```")
     md.append(
-        'Question: "{question}"\n\n'
-        '{user_prompt}\n'
-        'Describe what you see. Give counts or measurements where possible. '
-        'What does this tell you about the question?'
+        f'QUESTION: "{question}"\n\n'
+        'NEW FINDING (iteration N):\n{finding}\n\n'
+        'INVESTIGATION SO FAR:\n{findings_text}\n\n'
+        'Analyze the new finding. Confirm, contradict, or extend prior findings.\n'
+        'If enough evidence, respond with: {"action": "answer", "answer": "..."}'
+    )
+    md.append("```\n### Count variant:\n```")
+    md.append(
+        f'QUESTION: "{question}"\n\n'
+        'COUNT RESULTS (iteration N):\nTarget: "{{target}}"\n{pointing_stats}\n\n'
+        'INVESTIGATION SO FAR:\n{findings_text}\n\n'
+        'Interpret detections: account for double-counting, keyframe spacing vs '
+        'object size, detection confidence.'
     )
     md.append("```\n")
 
+    # Forced Answer
     md.append("---\n")
-    md.append("## 6. Scan Interpret (video + text)\n")
-    md.append("Sent with the captured scan video frames.\n")
+    md.append("## Forced Answer / Synthesis (OLMo, text-only)\n")
+    md.append(f"Token budget: {config['olmo_max_new_tokens_synthesis']}\n")
     md.append("```")
     md.append(
-        'Question: "{question}"\n\n'
-        '{user_prompt}\n'
-        'Scan: {num_frames} frames along {axis}, ~{spacing}µm between frames, {total}µm total.\n'
-        'Describe what you see across the frames. '
-        'Give counts or estimates where possible. '
-        'What does this tell you about the question?'
+        f'QUESTION: "{question}"\n\n'
+        'INVESTIGATION COMPLETE \u2014 ALL FINDINGS:\n{findings_text}\n\n'
+        'You have reached the maximum number of iterations.\n'
+        'Synthesize ALL findings into a comprehensive answer.\n'
+        'Be specific: include counts, spatial descriptions, and confidence level.'
     )
     md.append("```\n")
 
+    # Zoom table
     md.append("---\n")
-    md.append("## 7. Count — Keyframe Pointing (image + text)\n")
-    md.append("Sent once per sampled keyframe with that frame's image.\n")
+    md.append("## Appendix: Zoom Options\n")
     md.append("```")
-    md.append("Point to the {target}.")
-    md.append("```\n")
-
-    md.append("---\n")
-    md.append("## 8. Count — Interpret (text-only)\n")
-    md.append("Sent after all keyframe pointing is complete.\n")
-    md.append("```")
-    md.append(
-        'The user\'s question is: "{question}"\n\n'
-        'You pointed to {target} in {num_keyframes} keyframes sampled '
-        'every {interval} frames from a {axis} sweep of {num_frames} frames '
-        '(~{frame_spacing}µm between frames, ~{keyframe_spacing}µm between keyframes, '
-        '{total_dist}µm total).\n'
-        'Found {num_points} points across {frames_with_points} of {num_keyframes} sampled keyframes.\n'
-        'Points per keyframe: min={min}, max={max}, median={median}.\n\n'
-        'Based on these detections and the spatial extent of the scan, '
-        'what is your estimate? Consider that the same {target} may appear '
-        'in adjacent keyframes (keyframe spacing ~{keyframe_spacing}µm). '
-        'Give a specific count or range.'
-    )
-    md.append("```\n")
-
-    md.append("---\n")
-    md.append("## 9. Decision Retry (text-only)\n")
-    md.append("Appended to decision prompt when JSON parsing fails.\n")
-    md.append("```")
-    md.append(
-        'Your previous response was not valid JSON. '
-        'Please respond with ONLY a JSON object like: '
-        '{"action": "screenshot", "view": {"x": 100, "y": 100, "z": 100, '
-        '"layout": "xy", "crossSectionScale": 1.0}, "prompt": "describe what you see"}'
-    )
+    md.append(format_zoom_table())
     md.append("```\n")
 
     out_path = RESULTS_DIR / "prompts.md"
@@ -1272,9 +1617,10 @@ def main():
     print("  molmo-glancer — Autonomous Neuroglancer Visual Analysis")
     print("=" * 60)
 
-    # Load model
-    print("\n[1/3] Loading model ...")
-    model, processor, config = load_model()
+    # Initialize model manager
+    print("\n[1/3] Initializing ModelManager ...")
+    manager = ModelManager()
+    config = CONFIG
 
     # Read inputs
     print("\n[2/3] Reading inputs ...")
@@ -1287,7 +1633,7 @@ def main():
     # Run agent
     print("\n[3/3] Running agent loop ...")
     t0 = time.time()
-    answer = run_agent(model, processor, config, ng_link, question)
+    answer = run_agent(manager, config, ng_link, question)
     elapsed = time.time() - t0
 
     print(f"\n{'='*60}")

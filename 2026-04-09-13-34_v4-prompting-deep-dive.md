@@ -31,12 +31,15 @@ The 7B model frequently copies these exact coordinates and layouts instead of re
 about what view would actually answer the question. It also repeats the placeholder
 prompt text verbatim.
 
-### 1.2 Single-action-per-iteration is wasteful
+### 1.2 Single-action-per-iteration swap overhead
 
 Each iteration plans one action, captures one view, interprets it, and then decides the
 next. With model swapping this becomes 2 swap cycles per view — ~40-70s of overhead per
-view. The model also has no way to request "compare these two things side by side" because
-it can only see one view at a time.
+view. This is the cost of the 7B→32B quality jump.
+
+> **Future optimization:** Batched multi-view planning (N actions per iteration to
+> amortize swap overhead) is designed in `PLAN_batched_planning.md` for implementation
+> after v4's single-action OLMo flow is validated.
 
 ### 1.3 Limited action vocabulary
 
@@ -64,50 +67,70 @@ encourage deep chains for planning and synthesis.
 
 ### 2.1 Two-model conversation flow
 
+Each iteration makes 4 OLMo calls and 1 Molmo call, with only 2 physical swaps.
+OLMo stays loaded across the step 6 → step 1 boundary between iterations.
+
 ```
 ┌─────────────── Iteration N ───────────────────────────────────┐
 │                                                                │
-│  ┌─ OLMo 3.1 32B Think (text) ─────────────────────────────┐  │
+│  ┌─ OLMo 3.1 32B Think — 3 calls, stays loaded ────────────┐  │
 │  │                                                           │  │
-│  │  SYSTEM: Role + capabilities + volume info                │  │
-│  │  USER: Question + accumulated findings + action schema    │  │
-│  │  ASSISTANT: <think>deep reasoning</think>                 │  │
-│  │             {actions: [...], reasoning: "..."}             │  │
+│  │  Step 1: Plan — natural language investigation strategy   │  │
+│  │  "The lower-left showed misalignment; I need to check     │  │
+│  │   whether this persists at other z-depths..."             │  │
+│  │                                                           │  │
+│  │  Step 2: Action — strict JSON from schema                 │  │
+│  │  {"action": "screenshot", "view": {...}, "purpose": "..."}│  │
+│  │  → validate_action() resolves coords/zoom/layers          │  │
+│  │                                                           │  │
+│  │  Step 3: Vision instructions — craft Molmo2 guidance      │  │
+│  │  "Focus on channel overlap in lower-left quadrant.        │  │
+│  │   Compare green-magenta separation vs upper-right..."     │  │
+│  │  (count: refine target description for pointing instead)  │  │
 │  │                                                           │  │
 │  └───────────────────────────────────────────────────────────┘  │
-│              ↓ (planned actions)                                │
+│              ↓ swap_to_molmo (~5s)                               │
 │  ┌─ Molmo2-O-7B (vision) ──────────────────────────────────┐  │
 │  │                                                           │  │
-│  │  For each planned action:                                 │  │
-│  │    capture screenshot/scan → interpret with image prompt   │  │
-│  │    → finding_N                                            │  │
+│  │  Step 4: Capture screenshot/scan/count frames             │  │
+│  │  Step 5: Interpret with OLMo-crafted instructions         │  │
+│  │          + auto-generated template (imaging context, FOV)  │  │
+│  │  (count: per-keyframe pointing, not prose interpretation)  │  │
+│  │  → finding                                                │  │
 │  │                                                           │  │
 │  └───────────────────────────────────────────────────────────┘  │
-│              ↓ (findings)                                       │
-│  ┌─ OLMo 3.1 32B Think (text) ─────────────────────────────┐  │
+│              ↓ swap_to_olmo (~30-60s)                            │
+│  ┌─ OLMo 3.1 32B Think — reasoning ─────────────────────────┐  │
 │  │                                                           │  │
-│  │  Reason over all findings from this iteration             │  │
-│  │  Decide: plan more views? or answer?                      │  │
+│  │  Step 6: Reason over finding + prior evidence             │  │
+│  │  → continue (next iteration) or answer (end loop)         │  │
+│  │  (count: interprets pointing statistics here)             │  │
+│  │  OLMo stays loaded → step 1 of next iteration             │  │
 │  │                                                           │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                │
 └────────────────────────────────────────────────────────────────┘
 ```
 
+**Short-circuit:** If step 2 outputs `reason` or `answer`, steps 3-5 are
+skipped — no Molmo swap needed. OLMo handles it directly.
+
 ### 2.2 Prompt routing
 
-| Prompt type | Model | Why |
-|---|---|---|
-| First look interpret | Molmo2 | Needs vision |
-| Strategy planning | OLMo 32B | Pure reasoning, benefits from <think> |
-| Action decision | OLMo 32B | Complex spatial reasoning about what to look at next |
-| Screenshot interpret | Molmo2 | Needs vision |
-| Scan interpret | Molmo2 | Needs vision (video frames) |
-| Count pointing | Molmo2 | Needs vision (per-keyframe) |
-| Count interpret | OLMo 32B | Pure text, benefits from reasoning about statistics |
-| Reason step | OLMo 32B | Pure reasoning, synthesis |
-| Final answer | OLMo 32B | Quality-critical synthesis |
-| Forced answer | OLMo 32B | Last-resort synthesis |
+| Step | Prompt type | Model | Why |
+|---|---|---|---|
+| — | First look interpret | Molmo2 | Needs vision (Phase 1, before loop) |
+| 1 | Investigation plan | OLMo 32B | Strategic reasoning, benefits from <think> |
+| 2 | Action decision (JSON) | OLMo 32B | Structured output from schema |
+| 3 | Vision instructions | OLMo 32B | Context-aware guidance for Molmo2 |
+| 3' | Count target refinement | OLMo 32B | Variant: refine target noun/size for pointing |
+| 5 | Screenshot interpret | Molmo2 | Needs vision |
+| 5 | Scan interpret | Molmo2 | Needs vision (video frames) |
+| 5' | Count pointing | Molmo2 | Needs vision (per-keyframe pointing) |
+| 6 | Reasoning / synthesis | OLMo 32B | Evidence synthesis, decide next step |
+| 6' | Count interpret | OLMo 32B | Statistical reasoning about detections |
+| — | Final answer | OLMo 32B | Quality-critical synthesis (post-loop) |
+| — | Forced answer | OLMo 32B | Last-resort synthesis (max iterations) |
 
 ---
 
@@ -163,13 +186,10 @@ Think carefully before acting. Consider:
    numbers cause parroting; descriptive placeholders force the model to reason about
    what values to use.
 
-2. **Action batching** — The model returns an `actions` array, not a single action.
-   This is the key architectural change that amortizes swaps.
-
-3. **Expanded action vocabulary** — More fine-grained control over the Neuroglancer
+2. **Expanded action vocabulary** — More fine-grained control over the Neuroglancer
    state, reflecting the full `build_clean_state()` API surface.
 
-4. **Purpose-driven prompts** — Each action carries a `purpose` field explaining
+3. **Purpose-driven prompts** — Each action carries a `purpose` field explaining
    WHY this view is needed, not just what to look for.
 
 ### 4.2 New action schema
@@ -177,11 +197,9 @@ Think carefully before acting. Consider:
 ```
 ACTION SCHEMA:
 
-Respond with a JSON object. For visual actions, return an "actions" array
-(1 to {max_actions_per_plan} actions). For terminal actions (answer, reason),
-return a single action.
+Respond with a JSON object representing your next action.
 
-──── Visual Actions (batched) ────────────────────────────────────
+──── Visual Actions ─────────────────────────────────────────────
 
 screenshot — capture a 2D cross-section
   {"action": "screenshot",
@@ -251,18 +269,6 @@ answer — final answer (ends the session)
    "confidence": "<high|medium|low>",
    "evidence_summary": "<brief list of key evidence supporting the answer>"}
 
-──── Batched Response Format ─────────────────────────────────────
-
-For visual actions, wrap in an actions array:
-  {"actions": [
-     <action_1>,
-     <action_2>,
-     ...
-   ],
-   "reasoning": "<why these specific views, what you expect to learn>"}
-
-For reason/answer, return the action directly (no array).
-
 ──── Constraints ─────────────────────────────────────────────────
 
 LAYOUT: "xy", "xz", "yz", "4panel"
@@ -283,7 +289,7 @@ MAX FRAMES: {max_scan_frames} per scan/count action.
 |---|---|---|
 | Example coordinates | Concrete volume center (`"x": 250, "y": 250`) | Schematic `<x_coordinate>` |
 | Example prompt text | `"<what specifically to look for>"` (parroted verbatim) | `"purpose"` key with descriptive placeholder |
-| Response format | Single `{"action": ...}` | `{"actions": [...], "reasoning": "..."}` for visual; single for terminal |
+| Response format | Single `{"action": ...}` | Single `{"action": ..., "purpose": "..."}` |
 | Prompt field | `"prompt"` (free-text, often copy-pasted) | `"purpose"` (intent-driven, explained) |
 | `answer` action | `{"action": "answer", "answer": "..."}` | Adds `confidence` and `evidence_summary` |
 | Layer control | `"show": [1, 2]` only | `"show"` + `"shaderRange"` documented at action level |
@@ -307,10 +313,18 @@ This separation prevents the 32B model from wasting tokens trying to craft a
 
 ---
 
-## 5. Multi-View Planning Prompt
+## 5. Per-Iteration OLMo Prompts (Steps 1-3)
 
-### 5.1 Planning prompt template (replaces Phase 2 plan in v3)
+Each iteration has three OLMo calls before the Molmo vision phase. All three
+run while OLMo is continuously loaded — no swaps between them.
 
+### 5.1 Step 1 — Investigation plan (natural language)
+
+Produces a natural language reasoning trace about what to look at next and why.
+This output is stored in history and passed to step 2 as context. No JSON, no
+action schema — pure strategic reasoning.
+
+**First iteration (after first look):**
 ```
 You have examined a 3D volume and received this initial description:
 "{first_look_finding}"
@@ -320,42 +334,94 @@ QUESTION: "{question}"
 VOLUME:
 {volume_info}
 
-Based on this initial view, plan your investigation strategy.
-Return an actions array with 1-{max_actions_per_plan} views to capture.
+Plan your investigation strategy. What should you look at first, and why?
 
 Consider:
 - What spatial regions need examination to answer the question?
-- Would different layouts (xy vs xz vs yz) reveal different information?
-- Would a scan (video sweep) show spatial distribution better than static views?
+- Would a different layout (xy vs xz vs yz) reveal different information?
+- Would a scan (video sweep) show spatial distribution better than a static view?
 - Would toggling layer visibility reveal alignment, segmentation quality, etc.?
 - Is the question quantitative (need count action) or qualitative (scan/screenshot)?
-
-Do NOT plan all views at once — plan the most informative first batch.
-You will see the results and can plan more views afterward.
 ```
 
-### 5.2 Decision prompt template (iteration N, replaces `build_decision_prompt`)
-
+**Subsequent iterations:**
 ```
 QUESTION: "{question}"
-
-VOLUME:
-{volume_info}
-
-{action_schema}
 
 INVESTIGATION SO FAR:
 
 {structured_findings}
 
-Iteration {N}/{max}. Plan your next actions.
+Iteration {N}/{max}. What should you investigate next, and why?
 
-If you have enough evidence to answer the question confidently, use the
-answer action. If findings are contradictory or incomplete, plan views
-that would resolve the uncertainty.
+Consider what spatial regions remain unexplored, whether findings are
+consistent, and whether you have enough evidence to answer.
 ```
 
-### 5.3 Structured findings format
+### 5.2 Step 2 — Action decision (strict JSON)
+
+Receives step 1's plan and outputs a valid JSON action from the schema.
+This is the only call that includes the action schema.
+
+```
+YOUR INVESTIGATION PLAN:
+{step1_plan_output}
+
+{action_schema}
+
+Output the JSON action that executes your plan. Include a "purpose" field
+explaining what you expect to learn from this view.
+
+If you already have enough evidence, use the answer action instead.
+```
+
+### 5.3 Step 3 — Vision instructions for Molmo2
+
+Receives the validated action JSON and crafts specific instructions for the
+vision model. This output is prepended to the auto-generated interpret template
+(§8.1-8.3), which provides the structural scaffolding (imaging context, spatial
+metadata, FOV). OLMo adds investigation-specific focus.
+
+**For screenshot/scan actions:**
+```
+You have planned this view:
+{action_json_summary}
+
+PURPOSE: {purpose}
+QUESTION: "{question}"
+
+RECENT FINDINGS:
+{last_2_findings}
+
+Write specific instructions for the vision model that will interpret this view.
+Tell it:
+- What specific features or structures to focus on
+- What region of the image matters most for this investigation
+- What to compare against prior findings (if any)
+- Any artifacts or confounds to watch for
+
+Keep it concise (2-4 sentences). The vision model also receives standard
+imaging context and spatial metadata automatically.
+```
+
+**Count variant — refine target description for pointing:**
+```
+You have planned a count action:
+{action_json_summary}
+
+PURPOSE: {purpose}
+TARGET: "{target}"
+
+The vision model will point to each instance of the target on sampled keyframes.
+Refine the target description to help the model identify the right objects:
+- What size and shape are the targets?
+- What intensity or color distinguishes them from background?
+- Should the model ignore any similar-looking artifacts?
+
+Output a refined pointing instruction (1-2 sentences).
+```
+
+### 5.4 Structured findings format
 
 Replace the flat `format_history_entry()` with structured blocks that OLMo can
 reference by iteration number:
@@ -367,65 +433,111 @@ reference by iteration number:
     Approximately 20-30 bright cell bodies in this cross-section..."
   FOV: x=[0..497], y=[0..497]
 
-── Iteration 1 (batch of 3 views) ────────────────────────────
-  View 1a: screenshot, xy, z=50, full zoom
+── Iteration 1 ───────────────────────────────────────────────
+  View: screenshot, xy, z=50, full zoom
   Purpose: "Check neuron density in first quarter of volume"
   Finding: "Sparse — only 5-8 neurons visible at this depth..."
   FOV: x=[0..497], y=[0..497]
 
-  View 1b: screenshot, xy, z=150, full zoom
-  Purpose: "Check neuron density in middle of volume"
-  Finding: "Dense cluster of ~25 neurons near center..."
-  FOV: x=[0..497], y=[0..497]
-
-  View 1c: scan, z_sweep, z=0..220, 50 frames
+── Iteration 2 ───────────────────────────────────────────────
+  View: scan, z_sweep, z=0..220, 50 frames
   Purpose: "Survey full z-depth for neuron distribution"
   Finding: "Neurons concentrated in z=80-180 range, sparse at edges..."
+  Swept: z=[0..220]µm, FOV per frame: x=[0..497], y=[0..497]
 
-  Reasoning: "Most neurons are in the middle third of the volume (z=80-180).
-  Need to count more carefully in that region."
-
-── Iteration 2 (count action) ────────────────────────────────
-  View 2a: count, z_sweep, z=80..180, target=neurons, keyframe_interval=3
+── Iteration 3 ───────────────────────────────────────────────
+  View: count, z_sweep, z=80..180, target=neurons, keyframe_interval=3
   Purpose: "Get grounded count in high-density region"
   Finding: "DETECTED: 187 instances across 12/17 keyframes.
     Per keyframe: min=3, max=24, median=15."
-
   Reasoning: "187 raw detections with keyframe_interval=3 and ~5µm spacing
   means significant double-counting of neurons spanning multiple slices."
 ```
 
 This format:
-- Numbers iterations and sub-views for easy reference
+- Numbers iterations for easy reference
 - Preserves `purpose` alongside `finding` so OLMo can assess whether its investigation
   strategy is working
 - Includes FOV context so OLMo knows what spatial region each view covered
-- Includes the reasoning output from the previous OLMo pass
+- Includes the reasoning output from the OLMo reason phase
 
 ---
 
-## 6. Reasoning Phase Prompt (post-findings, pre-decision)
+## 6. Reasoning Phase Prompt (Step 6)
 
-After Molmo2 interprets all views from a batch, OLMo reasons over them:
+After Molmo2 interprets the captured view, OLMo reasons over the new finding
+combined with prior history. This is an explicit separate call (step 6) — not
+folded into the decision prompt. OLMo stays loaded from this step into the next
+iteration's step 1, so the reasoning flows directly into planning.
+
+### 6.1 Post-finding reasoning prompt
 
 ```
 QUESTION: "{question}"
 
-You planned {N} views this iteration. Here are the results:
+NEW FINDING (iteration {N}):
+{latest_finding_with_fov}
 
-{new_findings_this_iteration}
+INVESTIGATION SO FAR:
+{structured_findings}
 
-Combined with your prior investigation:
-{compressed_prior_findings}
+Analyze the new finding in context of your prior investigation:
 
-Analyze these findings and decide your next step:
+1. Does this finding confirm, contradict, or extend previous findings?
+2. What spatial regions remain unexplored?
+3. Do you have sufficient evidence to answer the question confidently?
+
+If you have enough evidence, respond with your answer using the answer action:
+{"action": "answer", "answer": "...", "confidence": "...", "evidence_summary": "..."}
+
+Otherwise, summarize your current understanding and what remains uncertain.
+This reasoning will inform your next investigation step.
+```
+
+### 6.2 Count interpretation variant (step 6')
+
+When the action was `count`, step 6 receives the raw pointing statistics instead
+of a prose finding. OLMo interprets the detection data:
+
+```
+QUESTION: "{question}"
+
+COUNT RESULTS (iteration {N}):
+Target: "{target}"
+{pointing_statistics}
+{spatial_distribution_summary}
+
+INVESTIGATION SO FAR:
+{structured_findings}
+
+Interpret these detection results:
+- Account for double-counting (objects spanning multiple z-slices appear
+  in adjacent keyframes)
+- Keyframe spacing vs object size: if spacing < diameter, expect overcounting
+- Detection confidence: low-contrast or partial objects may be missed
+
+Then decide: do you have sufficient evidence to answer, or do you need
+more investigation?
+```
+
+### 6.3 Explicit reason action (short-circuit from step 2)
+
+When step 2 outputs a `reason` action (no new view needed), steps 3-5 are
+skipped and OLMo reasons directly:
+
+```
+QUESTION: "{question}"
+
+INVESTIGATION SO FAR:
+{structured_findings}
+
+Your reasoning request: "{reason_question}"
+
+Analyze the evidence and decide your next step:
 
 1. If the evidence is sufficient, provide your answer.
-2. If findings conflict, identify the contradiction and plan views to resolve it.
-3. If critical regions remain unexplored, plan the next batch of views.
-4. If you need to perform quantitative analysis on existing data, use reason.
-
-Respond with your next action (actions array for more views, or answer/reason).
+2. If findings conflict, identify the contradiction and plan a view to resolve it.
+3. If critical regions remain unexplored, describe what to investigate next.
 ```
 
 ---
@@ -438,18 +550,20 @@ Think models produce `<think>` blocks (often 1000-2500 tokens) BEFORE the actual
 response. The budget must accommodate both. If `max_new_tokens` is too small, the
 model exhausts its budget mid-think and never emits the JSON — a silent total failure.
 
-| Prompt type | max_new_tokens | Think budget | Response budget | Rationale |
-|---|---|---|---|---|
-| Strategy planning | 4096 | ~1500-2000 | ~500-800 (JSON) | Plans 1-4 actions with reasoning |
-| Action decision | 4096 | ~1500-2000 | ~500-800 (JSON) | Same as planning, iterative |
-| Reasoning step | 6144 | ~2000-3000 | ~500-1000 (text) | Deeper chains for synthesis |
-| Final answer | 8192 | ~2000-4000 | ~1000-2000 (text) | Full synthesis, longest think |
-| Count interpret | 4096 | ~1000-2000 | ~500-800 (text) | Statistical reasoning |
+| Step | Prompt type | max_new_tokens | Think budget | Response budget | Rationale |
+|---|---|---|---|---|---|
+| 1 | Investigation plan | 4096 | ~1500-2000 | ~500-1000 (text) | Strategic reasoning about what to look at |
+| 2 | Action decision (JSON) | 4096 | ~1500-2000 | ~500-800 (JSON) | Structured action output |
+| 3 | Vision instructions | 2048 | ~500-1000 | ~200-400 (text) | Light call — targeted guidance |
+| 3' | Count target refinement | 2048 | ~500-1000 | ~100-200 (text) | Light call — refine target noun |
+| 6 | Post-finding reasoning | 6144 | ~2000-3000 | ~500-1000 (text) | Deeper chains for synthesis |
+| 6' | Count interpretation | 6144 | ~2000-3000 | ~500-1000 (text) | Statistical reasoning about detections |
+| — | Final answer | 8192 | ~2000-4000 | ~1000-2000 (text) | Full synthesis, longest think |
 
 **Why the old 2048/4096 budgets were too low:** A 2048 budget with 1500 think tokens
-leaves only 548 tokens for the JSON actions array — barely enough for 2 actions,
-and truncation mid-JSON is a parse failure requiring a retry (which wastes a full
-swap cycle of ~40-70s).
+leaves only 548 tokens for the JSON action — barely enough for a single action with
+purpose, and truncation mid-JSON is a parse failure requiring a retry (which wastes
+a full swap cycle of ~40-70s).
 
 ### 7.2 Think token handling in code
 
@@ -496,19 +610,29 @@ without prescribing the exact reasoning steps.
 
 ## 8. Molmo2 Vision Prompts (unchanged model, refined prompts)
 
-Molmo2 continues to handle all vision calls. These prompts are generated
-programmatically from the action metadata — Molmo doesn't see the action schema.
+Molmo2 continues to handle all vision calls. The interpret prompt has two parts:
 
-### 8.1 Screenshot interpretation
+1. **OLMo-crafted instructions** (from step 3) — investigation-specific guidance
+   that tells Molmo2 what to focus on, what to compare, what to ignore.
+2. **Auto-generated template** (below) — structural scaffolding with imaging
+   context, spatial metadata, and FOV. Always present.
+
+`build_vision_interpret_prompt()` concatenates: step-3 instructions + template.
+
+### 8.1 Screenshot interpretation template
 
 ```
-Question: "{question}"
+{olmo_vision_instructions}
 
-{purpose_from_olmo}
+---
+
+Question: "{question}"
 
 This is a {layout} view at position ({x}, {y}, {z}), zoom={zoom_name}.
 Visible layers: {visible_layer_list}
 Field of view: {fov_description}
+
+{imaging_context_block}
 
 Describe what you see. Report:
 - What structures are present (type, shape, intensity)
@@ -517,16 +641,20 @@ Describe what you see. Report:
 - Anything unusual or noteworthy
 ```
 
-### 8.2 Scan interpretation
+### 8.2 Scan interpretation template
 
 ```
-Question: "{question}"
+{olmo_vision_instructions}
 
-{purpose_from_olmo}
+---
+
+Question: "{question}"
 
 Scan: {num_frames} frames along {axis}, {start} → {end}
 Frame spacing: ~{spacing}µm, total distance: {total}µm
 Layout: {layout}, zoom: {zoom_name}
+
+{imaging_context_block}
 
 Describe what you observe across the frames:
 - How does the content change along the scan axis?
@@ -535,8 +663,18 @@ Describe what you observe across the frames:
 - Estimate the spatial extent of notable features
 ```
 
-### 8.3 Count pointing (unchanged — Molmo2's pointing format)
+### 8.3 Count pointing (OLMo-refined target description)
 
+The pointing prompt uses OLMo's refined target description from step 3 (count
+variant) instead of the generic `{target}` noun. The refined description
+helps Molmo2 identify the right objects and avoid false detections.
+
+```
+{olmo_refined_pointing_instruction}
+Each {target_singular} is approximately {neuron_pixels} pixels across.
+```
+
+If step 3 produced no refinement (or for backward compatibility), falls back to:
 ```
 Point to the {target}.
 Each {target_singular} is approximately {neuron_pixels} pixels across.
@@ -608,13 +746,13 @@ The decision prompt must stay under 32K tokens. Budget allocation:
 
 ### 10.2 History compression strategy
 
-After 5 iterations with batched views, findings can accumulate. Strategy:
+After many iterations, findings can accumulate. Strategy:
 
 1. **Iterations 1-3:** Full findings with FOV, purpose, reasoning
 2. **Iterations 4+:** Compress older iterations to one-line summaries:
    ```
-   [Iter 1: 3 views — neurons concentrated z=80-180, sparse at edges]
-   [Iter 2: count z=80-180 — 187 raw detections, estimated ~60-80 unique]
+   [Iter 1: screenshot xy z=50 — sparse, only 5-8 neurons]
+   [Iter 2: scan z=0..220 — neurons concentrated z=80-180, sparse at edges]
    ```
 3. **Keep all count data verbatim** — quantitative results never compress
 4. **Keep most recent 2 iterations full** — the model needs detailed context for
@@ -649,9 +787,8 @@ def build_olmo_prompt(question, volume_info, history, config, iteration):
 v4 drops T4/compact profile support entirely (PLAN_v4.md D7). This simplifies
 the prompting design:
 
-- **One prompt path:** Schematic placeholders + batched actions. No fallback to
-  concrete examples or single-action format.
-- **One config:** No `max_actions_per_plan=1` special case. Always 4.
+- **One prompt path:** Schematic placeholders + purpose-driven actions. No fallback to
+  concrete examples.
 - **No image downscaling:** `max_image_side` is gone. Molmo always gets full-res images.
 - **OLMo always available:** No "skip swaps, use Molmo for text" fallback. Every
   text call goes through OLMo 32B.
@@ -665,16 +802,27 @@ This means there is exactly one code path to test and debug.
 
 ### New functions to add to `molmo_glancer.py`:
 
+**OLMo generation:**
 1. `strip_think_tokens(text)` — separate `<think>` blocks, detect truncation (§16.3)
-2. `ask_text_olmo(manager, system_prompt, user_prompt, max_new_tokens, sampling)` — OLMo generation via ChatML system+user roles, think handling, truncation recovery (§16.1, §16.3)
+2. `ask_text_olmo(manager, system_prompt, user_prompt, max_new_tokens, sampling)` — OLMo generation via ChatML system+user roles, think handling, truncation recovery (§16.1, §16.3). Returns `(text, token_counts)` matching `ask_text()` shape.
+
+**Per-iteration prompt builders (steps 1-3, 6):**
 3. `build_olmo_system_prompt(volume_info)` — system prompt with reasoning + spatial anchors (§3.2, §15.3, §7.3)
-4. `build_olmo_decision_prompt(question, volume_info, history, config, iteration)` — replaces `build_decision_prompt` for OLMo calls
-5. `build_vision_interpret_prompt(action, question, volume_info)` — generates Molmo2 interpret prompts with imaging context block (§15.6)
-6. `format_structured_findings(history)` — replaces `format_history_entry` with richer format including FOV (§15.2)
-7. `compress_findings(history, max_entries)` — token-aware history compression
-8. `parse_action_batch(model_output)` — extends `parse_action` to handle `{"actions": [...]}`
-9. `estimate_tokens(text)` — lightweight token counting for budget enforcement
-10. `assess_think_confidence(think_content)` — mine think blocks for uncertainty signals (§16.5)
+4. `build_plan_prompt(question, volume_info, history, iteration)` — step 1: natural language investigation plan (§5.1)
+5. `build_action_prompt(plan_output, action_schema)` — step 2: strict JSON action from schema (§5.2)
+6. `build_vision_instructions_prompt(action, question, recent_findings)` — step 3: craft targeted Molmo2 instructions (§5.3). Count variant: refine target description for pointing.
+7. `build_reasoning_prompt(question, finding, history)` — step 6: post-finding reasoning (§6.1). Count variant: includes pointing statistics interpretation (§6.2).
+
+**Vision prompt assembly:**
+8. `build_vision_interpret_prompt(action, question, volume_info, olmo_instructions)` — combines OLMo-crafted instructions (step 3) with auto-generated template + imaging context block (§8, §15.6)
+
+**History and context:**
+9. `format_structured_findings(history)` — replaces `format_history_entry` with richer format including FOV (§5.4)
+10. `compress_findings(history, max_entries)` — token-aware history compression
+11. `estimate_tokens(text)` — lightweight token counting for budget enforcement
+
+**Diagnostics:**
+12. `assess_think_confidence(think_content)` — mine think blocks for uncertainty signals (§16.5)
 
 ### New functions to add to `volume_info.py`:
 
@@ -692,10 +840,12 @@ CONFIG = {
     "max_context_tokens": 55000,
     # OLMo 3.1 32B Think (text reasoning)
     "max_olmo_context_tokens": 32000,
-    "max_actions_per_plan": 4,
     # OLMo generation budgets (§7.1 — includes think + response headroom)
-    "olmo_max_new_tokens_decision": 4096,
-    "olmo_max_new_tokens_synthesis": 8192,
+    "olmo_max_new_tokens_plan": 4096,          # step 1: investigation plan
+    "olmo_max_new_tokens_decision": 4096,      # step 2: JSON action
+    "olmo_max_new_tokens_vision_instr": 2048,  # step 3: vision instructions (light call)
+    "olmo_max_new_tokens_reasoning": 6144,     # step 6: post-finding reasoning
+    "olmo_max_new_tokens_synthesis": 8192,      # final answer
     "olmo_max_new_tokens_retry": 2048,
     "olmo_max_new_tokens_hard_cap": 16384,
     # OLMo sampling presets (§16.2)
@@ -718,74 +868,86 @@ CONFIG = {
 
 ### Prompt templates to update:
 
-1. **Action schema** — replace concrete examples with schematic placeholders
-2. **Decision prompt** — restructure for batched actions + structured findings
-3. **System prompt** — new OLMo-specific system prompt (not sent to Molmo2)
-4. **Reasoning prompt** — new post-findings reasoning prompt
-5. **Interpret prompts** — add `purpose` context from OLMo's plan
+1. **Action schema** — replace concrete examples with schematic placeholders + `purpose` field
+2. **Step 1 plan prompt** — natural language investigation planning (§5.1)
+3. **Step 2 action prompt** — strict JSON with schema (§5.2)
+4. **Step 3 vision instructions prompt** — craft Molmo2 guidance (§5.3) + count variant
+5. **Step 6 reasoning prompt** — post-finding reasoning (§6.1) + count variant (§6.2)
+6. **System prompt** — new OLMo-specific system prompt (not sent to Molmo2)
+7. **Interpret prompts** — combine OLMo instructions + auto-generated template (§8)
+8. **First look prompt** — add imaging context block, fix "voxels" → "µm"
+9. **`save_prompt_templates()`** — update to reflect all new prompt formats
 
 ---
 
-## 13. Example: Full Iteration Walkthrough
+## 13. Example: Iteration Walkthrough
 
 ### Setup
 - Volume: 497x497x220µm, 2 image layers (fixed green, moving magenta), 4panel
 - Question: "How well are neurons aligned between fixed and moving volumes?"
 
-### Iteration 1 — OLMo plans
+### Iteration 1
 
-OLMo receives: first look finding + question + schema
+**Step 1 — OLMo plans** (natural language)
 
-OLMo thinks:
+OLMo receives: first look finding + question + volume info
 ```
 <think>
-The question is about alignment quality between two channels. I need to:
-1. See each channel individually to understand what's in each
-2. See them overlaid to check for systematic shifts
-3. Check multiple z-depths since alignment may vary through the volume
-
-I should start with visibility toggling at the center, then scan through z.
+The question is about alignment quality between two channels. I need to see
+them overlaid to check for systematic shifts. Starting with both channels
+visible at the center — if well-aligned, green+magenta overlap produces
+white/bright regions. Misalignment shows as separated spots.
 </think>
 ```
+Plan: "I'll overlay both channels at the volume center to assess overall
+alignment quality. Green-magenta overlap should produce yellow/white if
+well-aligned; separated colors indicate misalignment."
 
-OLMo responds:
+**Step 2 — OLMo action** (strict JSON)
+
+OLMo receives: step 1 plan + action schema
 ```json
-{"actions": [
-  {"action": "screenshot",
-   "view": {"x": 249, "y": 249, "z": 110, "layout": "xy", "zoom": "full"},
-   "show": [1],
-   "purpose": "View fixed channel alone at volume center to see reference neuron positions"},
-  {"action": "screenshot",
-   "view": {"x": 249, "y": 249, "z": 110, "layout": "xy", "zoom": "full"},
-   "show": [2],
-   "purpose": "View moving channel alone at same position to compare against fixed"},
-  {"action": "screenshot",
-   "view": {"x": 249, "y": 249, "z": 110, "layout": "xy", "zoom": "full"},
-   "show": [1, 2],
-   "purpose": "Overlay both channels to see alignment — green/magenta overlap = good alignment"}
-],
- "reasoning": "Start with channel comparison at center. If well-aligned, green+magenta overlap produces white/bright regions. Misalignment shows as separated green and magenta spots."}
+{"action": "screenshot",
+ "view": {"x": 249, "y": 249, "z": 110, "layout": "xy", "zoom": "full"},
+ "show": [1, 2],
+ "purpose": "Overlay both channels to see alignment quality at center"}
 ```
 
-### System captures all 3 screenshots, Molmo2 interprets each
+**Step 3 — OLMo crafts vision instructions**
 
-Finding 1a: "Single green channel showing ~15 bright neurons scattered across the field..."
-Finding 1b: "Single magenta channel with similar neuron pattern, slightly shifted..."
-Finding 1c: "Overlay shows mostly yellow/white overlap with 2-3 neurons showing green-magenta separation in the lower-left quadrant..."
+OLMo receives: validated action JSON + purpose + question
+```
+"Look for regions where green and magenta signals overlap to form yellow/white
+ — this indicates good alignment. Pay special attention to individual neurons:
+ do they appear as single merged spots or as separated green-magenta pairs?
+ Note any regions where channels are consistently offset."
+```
 
-### Iteration 1 — OLMo reasons over findings
+**Steps 4-5 — Capture + Molmo2 interprets**
 
-OLMo receives all 3 findings and reasons:
+Molmo2 receives: OLMo's vision instructions + auto-generated template (imaging
+context block, spatial metadata, FOV).
+
+Finding: "Overlay shows mostly yellow/white overlap indicating good alignment.
+2-3 neurons in the lower-left quadrant show green-magenta separation suggesting
+local misalignment..."
+
+**Step 6 — OLMo reasons**
+
+OLMo receives: the new finding + full investigation history
 ```
 <think>
 Good alignment overall (most neurons overlap → white), but some separation in
 lower-left. This could be a local registration error. I should check if this
-misalignment is consistent across z-depths or just local. A z-scan with both
-channels visible would show this.
+misalignment is consistent across z-depths or just at this z-slice.
 </think>
 ```
+Reasoning output: "Good alignment confirmed across most of the center FOV.
+Local misalignment detected in lower-left quadrant (2-3 neurons show
+green-magenta separation). Next: check whether this offset persists at
+different z-depths to determine if it's a systematic or slice-specific error."
 
-Decides to plan more views targeting the misaligned region.
+→ Stored in history. Next iteration begins at step 1 (OLMo still loaded).
 
 ---
 
@@ -837,12 +999,13 @@ set only for screenshot actions. It must be populated for all captured views.
 **Formatted output for OLMo findings block:**
 ```
 ── Iteration 1 ──────────────────────────────────────────────
-  View 1a: screenshot, xy, z=110µm, zoom=full
+  View: screenshot, xy, z=110µm, zoom=full
   Purpose: "Check cell density at volume center"
   FOV: x=[0..497]µm, y=[0..497]µm  (slice at z=110µm)
   Finding: "Dense field of ~20-30 fluorescent cell bodies..."
 
-  View 1b: scan, z_sweep, 50 frames
+── Iteration 2 ──────────────────────────────────────────────
+  View: scan, z_sweep, 50 frames
   Purpose: "Survey depth distribution of cells"
   Swept: z=[0..220]µm  (full depth), FOV per frame: x=[0..497]µm, y=[0..497]µm
   Finding: "Cells concentrated in z=[80..160]µm..."
@@ -1292,22 +1455,19 @@ All changes are in existing files. No new modules needed.
    reasoning would increase Molmo2's context usage. Recommendation: pass only the
    `purpose` field, not the full reasoning.
 
-2. **Should the actions array allow mixing visual and terminal actions?**
-   E.g., `[screenshot, screenshot, answer]`? Recommendation: No. If OLMo is ready
-   to answer, it should answer directly. If it needs more views, it plans views.
-   Mixing would complicate the execution flow.
-
-3. **Should count interpretation move to OLMo?**
+2. **Should count interpretation move to OLMo?**
    In v3, `ask_text()` interprets count results using the 7B model. In v4, this
    should definitely use OLMo — statistical reasoning about keyframe overlap,
    double-counting, and extrapolation is exactly where the 32B model shines.
-   Recommendation: Yes, route count interpretation to OLMo.
+   Recommendation: Yes, route count interpretation to OLMo. This means:
+   - After Molmo2 does per-keyframe pointing, swap to OLMo for interpretation
+   - The count action dispatch must handle this extra swap within the iteration
+   - OLMo is already on GPU for the reason phase, so this is natural flow
 
-4. **How to handle OLMo JSON parse failures?**
+3. **How to handle OLMo JSON parse failures?**
    The 32B model is much more reliable at JSON generation than the 7B, but failures
-   still happen. Strategy: same retry with format reminder as v3, but adapt the
-   reminder to reference the batch format. If retry fails, treat the text as a
-   reason action.
+   still happen. Strategy: same retry with format reminder as v3. If retry fails,
+   treat the text as a reason action.
 
 ---
 

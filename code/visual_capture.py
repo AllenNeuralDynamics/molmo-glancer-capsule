@@ -4,11 +4,14 @@ visual_capture — Playwright-based clean state builder and screenshot capture.
 Handles:
 - Building clean NG states (overlay hiding, view spec application)
 - CSS injection to hide remaining UI chrome
-- Canvas-only screenshot capture with readiness polling
+- Canvas-only screenshot capture via chunk-stability readiness + JS toDataURL
 - Scan frame generation (video sweeps)
+
+Targets L40S exclusively — always uses hardware GPU rendering via EGL.
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import threading
@@ -26,22 +29,13 @@ SCRATCH_TMP = "/scratch/tmp"
 os.makedirs(SCRATCH_TMP, exist_ok=True)
 os.environ.setdefault("TMPDIR", SCRATCH_TMP)
 
-_CHROMIUM_ARGS_BASE = [
+CHROMIUM_ARGS = [
     "--disable-blink-features=AutomationControlled",
     f"--disk-cache-dir={SCRATCH_TMP}/chromium-cache",
     f"--crash-dumps-dir={SCRATCH_TMP}/chromium-crashes",
+    "--use-gl=egl",
 ]
 
-# Hardware GPU rendering via EGL — only for L40S (full profile).
-# T4 reserves its GPU entirely for model inference.
-_CHROMIUM_ARGS_GPU = _CHROMIUM_ARGS_BASE + ["--use-gl=egl"]
-
-
-def _chromium_args(config: dict = None) -> list[str]:
-    """Return Chromium launch args, with GPU acceleration for full profile."""
-    if config and config.get("quantization") is None:  # full profile = no quantization
-        return _CHROMIUM_ARGS_GPU
-    return _CHROMIUM_ARGS_BASE
 RESULTS_DIR = Path("/results")
 
 # CSS to hide all Neuroglancer UI chrome
@@ -54,13 +48,182 @@ NG_HIDE_CSS = """
     #neuroglancer-container > div > div:first-child { display: none !important; }
 """
 
+# Patch WebGL context creation so that preserveDrawingBuffer=true is set.
+# Without this, the framebuffer is cleared after each composite and
+# toDataURL() returns a black image. Must be applied via add_init_script
+# BEFORE page navigation.
+PRESERVE_DRAWING_BUFFER_JS = """
+    const _origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(type, attrs) {
+        if (type === 'webgl' || type === 'webgl2') {
+            attrs = Object.assign({}, attrs || {}, {preserveDrawingBuffer: true});
+        }
+        return _origGetContext.call(this, type, attrs);
+    };
+"""
+
+# JS to query total (needed, available) across all visible render layers.
+_CHUNK_COUNTS_JS = """(() => {
+    const v = window.viewer;
+    if (!v || !v.layerManager) return null;
+    let needed = 0, available = 0;
+    for (const ml of v.layerManager.managedLayers) {
+        if (!ml.layer || !ml.layer.renderLayers) continue;
+        for (const rl of ml.layer.renderLayers) {
+            const info = rl.layerChunkProgressInfo;
+            if (info && info.numVisibleChunksNeeded > 0) {
+                needed += info.numVisibleChunksNeeded;
+                available += info.numVisibleChunksAvailable;
+            }
+        }
+    }
+    return {needed, available};
+})()"""
+
+_CANVAS_TO_DATA_URL_JS = """() => {
+    const canvas = document.querySelector('canvas');
+    return canvas ? canvas.toDataURL('image/png') : null;
+}"""
+
+# Readiness constants (matching validated probe: _data_ready_simple.py)
+STABLE_POLLS = 4       # consecutive unchanged (available, needed) polls → ready
+POLL_S = 0.5           # seconds between stability polls
+TIMEOUT_S = 60.0       # max wait for chunk stability
+WARMUP_S = 10.0        # max wait for viewer to initialise (needed > 0)
+WARMUP_POLL_S = 0.2    # seconds between warmup polls
+
+
+# ── Chunk-Stability Readiness ───────────────────────────────────────────────
+
+def _get_chunk_counts(page) -> tuple[int, int]:
+    """Query total (needed, available) across all visible render layers."""
+    result = page.evaluate(_CHUNK_COUNTS_JS)
+    if result is None:
+        return (0, 0)
+    return (result["needed"], result["available"])
+
+
+def _wait_for_data_loaded(page, timeout_s=TIMEOUT_S, stable_polls=STABLE_POLLS,
+                          poll_s=POLL_S, warmup=True):
+    """Wait until chunk counts (available, needed) are stable.
+
+    Handles both 100%-loaded and plateau cases (e.g. links where available
+    stabilises below needed). Declares ready when (available, needed) is
+    unchanged for `stable_polls` consecutive reads.
+
+    Parameters
+    ----------
+    page : playwright page
+    timeout_s : float
+        Max wait time for stability after warmup.
+    stable_polls : int
+        Consecutive unchanged polls required.
+    poll_s : float
+        Seconds between stability polls.
+    warmup : bool
+        If True, first wait up to WARMUP_S for viewer to initialise (needed > 0).
+    """
+    if warmup:
+        t_start = time.time()
+        viewer_ready = False
+        while time.time() - t_start < WARMUP_S:
+            needed, available = _get_chunk_counts(page)
+            if needed > 0:
+                viewer_ready = True
+                print(f"    Viewer ready at {time.time() - t_start:.1f}s "
+                      f"(needed={needed}, available={available})")
+                break
+            time.sleep(WARMUP_POLL_S)
+        if not viewer_ready:
+            print(f"    WARNING: viewer not ready after {WARMUP_S}s")
+            return
+
+    t0 = time.time()
+    prev = (-1, -1)
+    stable_count = 0
+
+    while time.time() - t0 < timeout_s:
+        time.sleep(poll_s)
+        needed, available = _get_chunk_counts(page)
+        cur = (available, needed)
+        if cur == prev and needed > 0:
+            stable_count += 1
+            if stable_count >= stable_polls:
+                pct = available / needed * 100 if needed > 0 else 0
+                print(f"    Chunks stable: {available}/{needed} ({pct:.0f}%)")
+                return
+        else:
+            stable_count = 0
+        prev = cur
+
+    print(f"    WARNING: chunk stability timeout after {timeout_s}s")
+
+
+async def _async_wait_for_data_loaded(page, timeout_s=TIMEOUT_S,
+                                      stable_polls=STABLE_POLLS, poll_s=POLL_S,
+                                      warmup=True):
+    """Async version of _wait_for_data_loaded for scan frame capture."""
+    if warmup:
+        t_start = time.time()
+        viewer_ready = False
+        while time.time() - t_start < WARMUP_S:
+            result = await page.evaluate(_CHUNK_COUNTS_JS)
+            needed = result["needed"] if result else 0
+            if needed > 0:
+                viewer_ready = True
+                break
+            await asyncio.sleep(WARMUP_POLL_S)
+        if not viewer_ready:
+            print(f"    WARNING: viewer not ready after {WARMUP_S}s")
+            return
+
+    t0 = time.time()
+    prev = (-1, -1)
+    stable_count = 0
+
+    while time.time() - t0 < timeout_s:
+        await asyncio.sleep(poll_s)
+        result = await page.evaluate(_CHUNK_COUNTS_JS)
+        if result is None:
+            continue
+        cur = (result["available"], result["needed"])
+        if cur == prev and result["needed"] > 0:
+            stable_count += 1
+            if stable_count >= stable_polls:
+                return
+        else:
+            stable_count = 0
+        prev = cur
+
+
+# ── Canvas Capture ──────────────────────────────────────────────────────────
+
+def _capture_canvas(page) -> bytes:
+    """Capture the WebGL canvas via toDataURL(). Returns PNG bytes.
+
+    Requires preserveDrawingBuffer=true to have been set via init script
+    before navigation, otherwise the framebuffer is cleared after compositing
+    and this returns a black image.
+    """
+    data_url = page.evaluate(_CANVAS_TO_DATA_URL_JS)
+    if not data_url:
+        raise RuntimeError("No canvas found on page")
+    return base64.b64decode(data_url.split(",", 1)[1])
+
+
+async def _async_capture_canvas(page) -> bytes:
+    """Async version of _capture_canvas for scan frame capture."""
+    data_url = await page.evaluate(_CANVAS_TO_DATA_URL_JS)
+    if not data_url:
+        raise RuntimeError("No canvas found on page")
+    return base64.b64decode(data_url.split(",", 1)[1])
+
 
 def _canvas_has_data(png_bytes: bytes, threshold: float = 0.02) -> bool:
     """Check if more than `threshold` fraction of canvas pixels are non-black.
 
-    NG UI chrome (axis labels, crosshairs, scale bar) covers <1% of pixels.
-    Actual volume data fills much more. Default threshold of 2% distinguishes
-    empty-with-chrome from data-loaded.
+    Post-capture sanity check. If chunk stability declared ready but the
+    canvas is blank, something went wrong (e.g. WebGL context lost).
     """
     img = Image.open(BytesIO(png_bytes))
     arr = np.array(img)
@@ -68,53 +231,7 @@ def _canvas_has_data(png_bytes: bytes, threshold: float = 0.02) -> bool:
     return non_black > threshold
 
 
-def _wait_for_canvas_stable(page, interval_ms: int = 150, max_attempts: int = 10,
-                            wait_for_data: bool = False):
-    """Poll until the canvas pixels stop changing between consecutive snapshots (sync).
-
-    If wait_for_data=True, first waits until the canvas has meaningful pixel
-    content (>2% non-black), then waits for stability. Use for cold loads.
-    """
-    canvas = page.locator("canvas").first
-    if wait_for_data:
-        for _ in range(60):  # up to ~30s for data to arrive
-            png = canvas.screenshot()
-            if _canvas_has_data(png):
-                break
-            time.sleep(0.5)
-    prev_hash = None
-    for _ in range(max_attempts):
-        png = canvas.screenshot()
-        h = hashlib.md5(png).hexdigest()
-        if h == prev_hash:
-            return
-        prev_hash = h
-        time.sleep(interval_ms / 1000)
-
-
-async def _async_wait_for_canvas_stable(page, interval_ms: int = 150, max_attempts: int = 10,
-                                        wait_for_data: bool = False):
-    """Poll until the canvas pixels stop changing between consecutive snapshots (async).
-
-    If wait_for_data=True, first waits until the canvas has meaningful pixel
-    content (>2% non-black), then waits for stability. Use for cold loads.
-    """
-    canvas = page.locator("canvas").first
-    if wait_for_data:
-        for _ in range(60):
-            png = await canvas.screenshot()
-            if _canvas_has_data(png):
-                break
-            await asyncio.sleep(0.5)
-    prev_hash = None
-    for _ in range(max_attempts):
-        png = await canvas.screenshot()
-        h = hashlib.md5(png).hexdigest()
-        if h == prev_hash:
-            return
-        prev_hash = h
-        await asyncio.sleep(interval_ms / 1000)
-
+# ── Clean State Builder ─────────────────────────────────────────────────────
 
 def build_clean_state(base_state, view_spec: dict, volume_info=None):
     """Apply view spec + overlay hiding to an NG state. Returns a new NeuroglancerState.
@@ -207,38 +324,49 @@ def build_clean_state(base_state, view_spec: dict, volume_info=None):
     return state
 
 
-def capture_screenshot(page, state, config: dict, screenshot_id: int) -> Image.Image:
-    """Navigate to an NG state URL, wait for data, and capture a clean canvas screenshot.
+# ── Screenshot Capture ──────────────────────────────────────────────────────
 
-    Args:
-        page: Playwright page object (already created with correct viewport).
-        state: NeuroglancerState object with clean view settings.
-        config: GPU profile config dict (for max_image_side).
-        screenshot_id: Sequential ID for saving the PNG.
+def capture_screenshot(page, state, screenshot_id: int) -> Image.Image:
+    """Navigate to an NG state URL, wait for chunk stability, and capture canvas.
 
-    Returns:
-        PIL Image of the canvas.
+    Uses chunk-stability readiness (poll Neuroglancer's layerChunkProgressInfo
+    until stable) followed by JS canvas.toDataURL() capture. Bypasses
+    Playwright's screenshot machinery which can timeout on font/animation
+    stabilisation.
+
+    Parameters
+    ----------
+    page : playwright page
+        Page with preserveDrawingBuffer init script already applied.
+    state : NeuroglancerState
+        Clean view state to navigate to.
+    screenshot_id : int
+        Sequential ID for saving the PNG.
+
+    Returns
+    -------
+    PIL.Image.Image
     """
     url = state.to_url()
     print(f"  Navigating to NG URL ({len(url)} chars) ...")
 
-    page.goto(url, wait_until="domcontentloaded", timeout=10000)
+    page.goto(url, wait_until="domcontentloaded", timeout=15000)
 
-    # Inject CSS to hide UI chrome
+    # Wait for chunk stability
+    _wait_for_data_loaded(page)
+
+    # Hide UI chrome, brief delay for CSS to take effect
     page.add_style_tag(content=NG_HIDE_CSS)
+    time.sleep(0.1)
 
-    # Wait for data to arrive (canvas changes from blank), then stabilize
-    _wait_for_canvas_stable(page, wait_for_data=True)
+    # Capture canvas via JS toDataURL
+    png_bytes = _capture_canvas(page)
 
-    # Capture canvas only
-    canvas = page.locator("canvas").first
-    png_bytes = canvas.screenshot()
+    # Sanity check — abort if blank
+    if not _canvas_has_data(png_bytes):
+        print(f"  WARNING: canvas appears blank after chunk stability — possible WebGL issue")
+
     img = Image.open(BytesIO(png_bytes)).convert("RGB")
-
-    # Downscale on T4 if needed
-    max_side = config.get("max_image_side")
-    if max_side and max(img.size) > max_side:
-        img.thumbnail((max_side, max_side), Image.LANCZOS)
 
     # Save to results
     screenshot_dir = RESULTS_DIR / "screenshots"
@@ -250,16 +378,21 @@ def capture_screenshot(page, state, config: dict, screenshot_id: int) -> Image.I
     return img
 
 
-def create_browser(playwright, config: dict = None):
-    """Create a Playwright browser + page with 1024x1024 viewport."""
+def create_browser(playwright):
+    """Create a Playwright browser + page with 1024x1024 viewport.
+
+    Applies the preserveDrawingBuffer WebGL patch via init script so that
+    toDataURL() reads the live framebuffer instead of returning black.
+    """
     browser = playwright.chromium.launch(
         headless=True,
-        args=_chromium_args(config),
+        args=CHROMIUM_ARGS,
     )
     context = browser.new_context(
         viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
     )
     page = context.new_page()
+    page.add_init_script(PRESERVE_DRAWING_BUFFER_JS)
     return browser, page
 
 
@@ -274,15 +407,23 @@ def execute_scan(base_state, scan_spec: dict, volume_info, config: dict, scan_id
     its own async event loop to avoid conflicts with the sync Playwright
     instance in the main thread.
 
-    Args:
-        base_state: NeuroglancerState to use as template.
-        scan_spec: Dict with scan_type, start, end, frames, layout, crossSectionScale, etc.
-        volume_info: VolumeInfo for bounds clamping.
-        config: GPU profile config.
-        scan_id: Sequential ID for naming the video file.
+    Parameters
+    ----------
+    base_state : NeuroglancerState
+        Template state.
+    scan_spec : dict
+        Scan parameters (scan_type, start, end, frames, layout, crossSectionScale, etc.).
+    volume_info : VolumeInfo
+        For bounds clamping.
+    config : dict
+        Config dict (uses max_scan_frames).
+    scan_id : int
+        Sequential ID for naming the video file.
 
-    Returns:
-        List of PIL Images (one per frame).
+    Returns
+    -------
+    list[PIL.Image.Image]
+        One image per frame.
     """
     scan_type = scan_spec.get("scan_type", "z_sweep")
     num_frames = min(scan_spec.get("frames", config["max_scan_frames"]), config["max_scan_frames"])
@@ -309,24 +450,23 @@ def execute_scan(base_state, scan_spec: dict, volume_info, config: dict, scan_id
             view_spec["layerVisibility"] = scan_spec["layerVisibility"]
         states.append(build_clean_state(base_state, view_spec, volume_info))
 
-    max_side = config.get("max_image_side")
-
     async def _run_sequential():
         from playwright.async_api import async_playwright
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
                 headless=True,
-                args=_chromium_args(config),
+                args=CHROMIUM_ARGS,
             )
             ctx = await browser.new_context(
                 viewport={"width": VIEWPORT_SIZE, "height": VIEWPORT_SIZE},
             )
             page = await ctx.new_page()
+            await page.add_init_script(PRESERVE_DRAWING_BUFFER_JS)
             try:
-                # First frame: full navigation, wait for data to load
+                # First frame: full navigation, wait for warmup + chunk stability
                 await page.goto(states[0].to_url(), wait_until="domcontentloaded", timeout=15000)
                 await page.add_style_tag(content=NG_HIDE_CSS)
-                await _async_wait_for_canvas_stable(page, wait_for_data=True)
+                await _async_wait_for_data_loaded(page, warmup=True)
 
                 frames = []
                 for i, state in enumerate(states):
@@ -334,13 +474,12 @@ def execute_scan(base_state, scan_spec: dict, volume_info, config: dict, scan_id
                         # Hash-fragment update — adjacent slices share ~90% of chunks
                         state_json = json.dumps(state.data, separators=(",", ":"))
                         await page.evaluate("(h) => { location.hash = '!' + h }", state_json)
-                        await _async_wait_for_canvas_stable(page)
+                        await _async_wait_for_data_loaded(page, warmup=False)
 
-                    canvas = page.locator("canvas").first
-                    png_bytes = await canvas.screenshot()
+                    # Brief pause for rendering after stability
+                    await asyncio.sleep(0.1)
+                    png_bytes = await _async_capture_canvas(page)
                     img = Image.open(BytesIO(png_bytes)).convert("RGB")
-                    if max_side and max(img.size) > max_side:
-                        img.thumbnail((max_side, max_side), Image.LANCZOS)
                     frames.append(img)
 
                     if (i + 1) % 10 == 0 or i == 0:
@@ -437,9 +576,9 @@ def save_scan_video(frames: list[Image.Image], scan_id: int,
     except Exception as e2:
         # Last resort: just save individual frames as PNGs
         print(f"  WARNING: gif save also failed ({e2}), saving individual frames")
-        for i, frame in enumerate(frames):
+        for i, arr in enumerate(frame_arrays):
             frame_path = video_dir / f"scan_{scan_id:03d}{suffix}_frame_{i:03d}.png"
-            Image.fromarray(frame_arrays[i]).save(frame_path)
+            Image.fromarray(arr).save(frame_path)
         print(f"  Saved {len(frames)} frames as PNGs in {video_dir}")
 
 
@@ -467,13 +606,19 @@ def annotate_screenshot(img: Image.Image, points: list[tuple[float, float]],
                         screenshot_id: int) -> Image.Image:
     """Draw point markers on a screenshot and save the annotated version.
 
-    Args:
-        img: Original screenshot PIL Image.
-        points: List of (x, y) pixel coordinates.
-        screenshot_id: ID for filename.
+    Parameters
+    ----------
+    img : PIL.Image.Image
+        Original screenshot.
+    points : list[tuple[float, float]]
+        List of (x, y) pixel coordinates.
+    screenshot_id : int
+        ID for filename.
 
-    Returns:
-        Annotated PIL Image.
+    Returns
+    -------
+    PIL.Image.Image
+        Annotated image.
     """
     annotated = _draw_markers(img, points)
 
@@ -491,14 +636,20 @@ def annotate_scan_frames(frames: list[Image.Image],
                          scan_id: int) -> list[Image.Image]:
     """Draw point markers on scan frames and save as annotated video.
 
-    Args:
-        frames: Original scan frame PIL Images.
-        points: List of (frame_idx, x, y) tuples. frame_idx is the 0-based
-                frame index from per-keyframe image pointing.
-        scan_id: ID for filename.
+    Parameters
+    ----------
+    frames : list[PIL.Image.Image]
+        Original scan frames.
+    points : list[tuple[float, float, float]]
+        List of (frame_idx, x, y) tuples. frame_idx is the 0-based
+        frame index from per-keyframe image pointing.
+    scan_id : int
+        ID for filename.
 
-    Returns:
-        List of annotated PIL Images.
+    Returns
+    -------
+    list[PIL.Image.Image]
+        Annotated frames.
     """
     points_by_frame: dict[int, list[tuple[float, float]]] = {}
     for frame_id, x, y in points:

@@ -1,101 +1,79 @@
 """
-gpu_config — GPU detection, profiles, and model loading for molmo-glancer.
+gpu_config — GPU validation, config, model loading, and swap management.
 
-Auto-detects hardware (T4 vs L40S) and selects quantization, resolution,
-and budget parameters accordingly. Same code, different config.
+Targets L40S (45 GB VRAM) exclusively. No T4/compact fallback.
+
+ModelManager handles symmetric swapping: both Molmo2 and OLMo are loaded
+from disk each time they're needed and deleted when done. Simpler than
+asymmetric (CPU-parking) at the cost of ~30s extra per Molmo load.
 """
+
+import gc
+import time
 
 import torch
 
-# ── GPU Profiles ────────────────────────────────────────────────────────────
+# ── Checkpoints ──────────────────────────────────────────────────────────────
 
-GPU_PROFILES = {
-    "compact": {          # T4 (15 GB) — dev/test
-        "quantization": "4bit",
-        "torch_dtype": torch.float16,
-        "max_image_side": 512,
-        "max_crops": 4,
-        "max_scan_frames": 50,
-        "max_agent_iterations": 8,
-        "max_context_tokens": 16000,
+MOLMO_CHECKPOINT = "/scratch/checkpoints/Molmo2-O-7B"
+OLMO_CHECKPOINT = "/scratch/checkpoints/Olmo-3.1-32B-Think"
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+CONFIG = {
+    # Molmo2-O-7B (vision)
+    "torch_dtype": torch.float16,
+    "max_scan_frames": 50,
+    "max_context_tokens": 55000,
+    # OLMo 3.1 32B Think (text reasoning)
+    "max_olmo_context_tokens": 32000,
+    # OLMo generation budgets (deep-dive §7.1)
+    "olmo_max_new_tokens_plan": 4096,
+    "olmo_max_new_tokens_decision": 4096,
+    "olmo_max_new_tokens_vision_instr": 2048,
+    "olmo_max_new_tokens_reasoning": 6144,
+    "olmo_max_new_tokens_synthesis": 8192,
+    "olmo_max_new_tokens_retry": 2048,
+    "olmo_max_new_tokens_hard_cap": 16384,
+    # OLMo sampling presets (deep-dive §16.2)
+    "olmo_sampling_structured": {
+        "temperature": 0.2, "top_p": 0.9,
+        "repetition_penalty": 1.1, "do_sample": True,
     },
-    "full": {             # L40S (45 GB) — production
-        "quantization": None,           # pure fp16
-        "torch_dtype": torch.float16,
-        "max_image_side": None,         # no downscale
-        "max_crops": 8,                 # 24 on demand for detail
-        "max_scan_frames": 50,
-        "max_agent_iterations": 20,
-        "max_context_tokens": 55000,
+    "olmo_sampling_synthesis": {
+        "temperature": 0.5, "top_p": 0.9,
+        "repetition_penalty": 1.1, "do_sample": True,
     },
+    "olmo_sampling_retry": {
+        "temperature": 0.1, "top_p": 0.9,
+        "repetition_penalty": 1.1, "do_sample": True,
+    },
+    # Agent loop
+    "max_agent_iterations": 20,
 }
 
-CHECKPOINT = "/scratch/checkpoints/Molmo2-O-7B"
+MIN_VRAM_GB = 40
 
 
-def detect_gpu_profile() -> str:
-    """Read GPU VRAM and return profile name: 'compact' or 'full'."""
+# ── GPU validation ──────────────────────────────────────────────────────────
+
+def assert_gpu():
+    """Verify CUDA GPU with >=40 GB VRAM is available, or abort."""
     if not torch.cuda.is_available():
-        print("WARNING: No CUDA GPU detected, defaulting to 'compact' profile (CPU).")
-        return "compact"
+        raise RuntimeError("No CUDA GPU detected. molmo-glancer requires an L40S (45 GB).")
 
     vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     gpu_name = torch.cuda.get_device_name(0)
     print(f"GPU: {gpu_name}, VRAM: {vram_gb:.1f} GB")
 
-    if vram_gb >= 40:
-        profile = "full"
-    else:
-        profile = "compact"
-
-    print(f"Selected profile: {profile}")
-    return profile
-
-
-def load_model(checkpoint: str = CHECKPOINT, profile: str | None = None):
-    """Load Molmo2-O-7B with profile-appropriate quantization.
-
-    Returns (model, processor, config_dict).
-    """
-    from transformers import AutoProcessor, AutoModelForImageTextToText
-
-    if profile is None:
-        profile = detect_gpu_profile()
-    config = GPU_PROFILES[profile]
-
-    print(f"Loading processor from {checkpoint} ...")
-    processor = AutoProcessor.from_pretrained(
-        checkpoint, trust_remote_code=True,
-    )
-
-    model_kwargs = {
-        "trust_remote_code": True,
-        "device_map": "auto",
-    }
-
-    if config["quantization"] == "4bit":
-        from transformers import BitsAndBytesConfig
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_quant_type="nf4",
-            llm_int8_skip_modules=["vision_backbone"],
+    if vram_gb < MIN_VRAM_GB:
+        raise RuntimeError(
+            f"Insufficient VRAM: {vram_gb:.1f} GB (need >={MIN_VRAM_GB} GB). "
+            f"molmo-glancer requires an L40S or equivalent."
         )
-        print(f"Loading model (4-bit NF4, vision in fp16) from {checkpoint} ...")
-    else:
-        model_kwargs["torch_dtype"] = config["torch_dtype"]
-        print(f"Loading model (fp16) from {checkpoint} ...")
 
-    model = AutoModelForImageTextToText.from_pretrained(checkpoint, **model_kwargs)
 
-    # Keep vision backbone in fp16 to avoid LayerNorm/cuBLAS issues on T4
-    if config["quantization"] == "4bit" and hasattr(model.model, "vision_backbone"):
-        model.model.vision_backbone.to(torch.float16)
-        print("  Vision backbone cast to fp16.")
-
-    print(f"Model loaded. Profile: {profile}")
-    return model, processor, config
-
+# ── VRAM monitoring ─────────────────────────────────────────────────────────
 
 def get_vram_usage() -> dict:
     """Return current VRAM usage in GB."""
@@ -110,3 +88,122 @@ def get_vram_usage() -> dict:
         "free": round(total - allocated, 2),
         "total": round(total, 2),
     }
+
+
+def _log_vram(label: str):
+    """Print VRAM usage with a label."""
+    v = get_vram_usage()
+    print(f"  VRAM [{label}]: {v['allocated']:.1f} GB allocated, "
+          f"{v['free']:.1f} GB free / {v['total']:.1f} GB total")
+
+
+def _clear_gpu():
+    """Delete all GPU tensors and reclaim VRAM."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+# ── ModelManager ────────────────────────────────────────────────────────────
+
+class ModelManager:
+    """Symmetric swap manager for Molmo2 and OLMo.
+
+    Only one model on GPU at a time. Both are loaded from /scratch SSD
+    and deleted when swapped out. No CPU parking — simpler at the cost
+    of reload time (~30s Molmo, ~30-60s OLMo).
+
+    Usage::
+
+        mgr = ModelManager()
+        mgr.swap_to_molmo()    # loads Molmo2 fp16
+        # ... use mgr.molmo_model, mgr.molmo_processor ...
+        mgr.swap_to_olmo()     # deletes Molmo, loads OLMo INT8
+        # ... use mgr.olmo_model, mgr.olmo_tokenizer ...
+        mgr.swap_to_molmo()    # deletes OLMo, loads Molmo2 again
+    """
+
+    def __init__(self):
+        assert_gpu()
+        self.active: str | None = None   # "molmo" | "olmo" | None
+
+        # Molmo2 state
+        self.molmo_model = None
+        self.molmo_processor = None
+
+        # OLMo state
+        self.olmo_model = None
+        self.olmo_tokenizer = None
+
+    def swap_to_molmo(self):
+        """Delete any active model, load Molmo2-O-7B fp16 from disk."""
+        from transformers import AutoProcessor, AutoModelForImageTextToText
+
+        if self.active == "molmo":
+            return  # already loaded
+
+        t0 = time.time()
+        print(f"\n[ModelManager] swap_to_molmo ...")
+
+        self._unload_all()
+
+        self.molmo_processor = AutoProcessor.from_pretrained(
+            MOLMO_CHECKPOINT, trust_remote_code=True,
+        )
+        self.molmo_model = AutoModelForImageTextToText.from_pretrained(
+            MOLMO_CHECKPOINT,
+            trust_remote_code=True,
+            torch_dtype=CONFIG["torch_dtype"],
+            device_map="auto",
+        )
+        self.active = "molmo"
+
+        elapsed = time.time() - t0
+        _log_vram("molmo loaded")
+        print(f"[ModelManager] Molmo2 ready ({elapsed:.1f}s)")
+
+    def swap_to_olmo(self):
+        """Delete any active model, load OLMo 3.1 32B Think INT8 from disk."""
+        from transformers import (
+            AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig,
+        )
+
+        if self.active == "olmo":
+            return  # already loaded
+
+        t0 = time.time()
+        print(f"\n[ModelManager] swap_to_olmo ...")
+
+        self._unload_all()
+
+        self.olmo_tokenizer = AutoTokenizer.from_pretrained(
+            OLMO_CHECKPOINT, trust_remote_code=True,
+        )
+        self.olmo_model = AutoModelForCausalLM.from_pretrained(
+            OLMO_CHECKPOINT,
+            trust_remote_code=True,
+            device_map="auto",
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+        )
+        self.active = "olmo"
+
+        elapsed = time.time() - t0
+        _log_vram("olmo loaded")
+        print(f"[ModelManager] OLMo ready ({elapsed:.1f}s)")
+
+    def _unload_all(self):
+        """Delete whichever model is currently loaded and reclaim VRAM."""
+        if self.active == "molmo":
+            del self.molmo_model
+            del self.molmo_processor
+            self.molmo_model = None
+            self.molmo_processor = None
+        elif self.active == "olmo":
+            del self.olmo_model
+            del self.olmo_tokenizer
+            self.olmo_model = None
+            self.olmo_tokenizer = None
+
+        self.active = None
+        _clear_gpu()

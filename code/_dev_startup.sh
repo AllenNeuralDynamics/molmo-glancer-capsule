@@ -29,7 +29,7 @@ echo "--- pip upgrade ---"
 # ---------------------------------------------------------------------------
 # Molmo2-O-7B inference stack
 # transformers>=4.57.1 required for Molmo2 model code
-# bitsandbytes: 4-bit NF4 quantization (~3.6 GB on T4) or fp16 on larger GPUs
+# bitsandbytes: INT8 quantization for OLMo 3.1 32B Think (~34 GB on L40S)
 # decord2: video frame decoding (required by Molmo2 even for image-only use)
 # ---------------------------------------------------------------------------
 echo ""

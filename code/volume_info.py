@@ -69,6 +69,7 @@ class LayerInfo:
     extent: list[float] | None         # [X, Y, Z] physical extent, or None if unknown
     visible: bool
     shader_range: list[float] | None   # [vmin, vmax] if available
+    role: str = ""                      # semantic role hint from _infer_layer_role()
 
 
 @dataclass
@@ -101,10 +102,16 @@ class VolumeInfo:
         lines = [
             f"Size: {s[0]:.0f} \u00d7 {s[1]:.0f} \u00d7 {s[2]:.0f} {units} (visible layers)",
         ]
+
+        # Voxel size (convert meters → µm)
+        if self.voxel_scales:
+            vs = [v * 1e6 for v in self.voxel_scales]
+            lines.append(f"Voxel: {vs[0]:.3f}\u00d7{vs[1]:.3f}\u00d7{vs[2]:.3f} {units}")
+
         if self.anisotropy_ratio > 1.5:
             lines.append(f"Note: z is {self.anisotropy_ratio:.1f}\u00d7 coarser than x/y")
 
-        # Per-layer listing (numbered for use with "show" key)
+        # Per-layer listing with role hints
         lines.append("Layers:")
         for i, l in enumerate(self.layers, 1):
             vis = "visible" if l.visible else "hidden"
@@ -112,7 +119,18 @@ class VolumeInfo:
                 ext = f"{l.extent[0]:.0f}\u00d7{l.extent[1]:.0f}\u00d7{l.extent[2]:.0f} {units}"
             else:
                 ext = "extent unknown"
-            lines.append(f"  {i}. {l.name} ({l.type}, {ext}) [{vis}]")
+
+            layer_line = f"  {i}. {l.name} ({l.type}, {ext}) [{vis}]"
+
+            # Add shader range if known
+            if l.shader_range:
+                layer_line += f"  contrast=[{l.shader_range[0]:.2f}, {l.shader_range[1]:.2f}]"
+
+            lines.append(layer_line)
+
+            # Role hint on next line
+            if l.role:
+                lines.append(f"     Role: {l.role}")
 
         lines.append(f"Center: x={cx:.1f}, y={cy:.1f}, z={cz:.1f}")
         lines.append(f"Ranges: x=[0..{s[0]:.0f}], y=[0..{s[1]:.0f}], z=[0..{s[2]:.0f}]")
@@ -153,6 +171,44 @@ def _get_shader_range(layer: dict) -> list[float] | None:
     return None
 
 
+def _infer_layer_role(layer: LayerInfo) -> str:
+    """Heuristic role inference from layer name, type, and source URL.
+
+    Returns a short semantic description of what the layer represents,
+    giving OLMo context about what bright/dark regions mean.
+    """
+    if layer.type == "segmentation":
+        return "object segmentation — distinct colors = distinct labeled objects"
+    if layer.type == "annotation":
+        name_lower = layer.name.lower()
+        if any(kw in name_lower for kw in ("point", "cell", "soma", "roi")):
+            return "point annotations"
+        if any(kw in name_lower for kw in ("line", "path", "trace", "skeleton")):
+            return "line/path annotations"
+        return "annotation layer"
+
+    # Image layers — classify by name keywords
+    name_lower = layer.name.lower()
+    source_lower = layer.source.lower() if layer.source else ""
+    combined = name_lower + " " + source_lower
+
+    if any(kw in combined for kw in ("dapi", "hoechst", "nuclear", "nuclei")):
+        return "nuclear stain — bright spots = all cell nuclei"
+    if any(kw in combined for kw in ("gfp", "cfos", "c-fos", "neuron",
+                                      "green", "fluoresc")):
+        return "fluorescence channel — bright spots = labeled structures"
+    if any(kw in combined for kw in ("fixed", "reference", "ref_")):
+        return "fixed/reference volume"
+    if any(kw in combined for kw in ("moving", "target", "mov_")):
+        return "moving/target volume (registration partner)"
+    if any(kw in combined for kw in ("atlas", "ccf", "allen")):
+        return "reference atlas — shows anatomical regions"
+    if any(kw in combined for kw in ("registered", "aligned", "warped")):
+        return "registered/aligned channel"
+
+    return "fluorescence channel — bright regions = signal, dark = background"
+
+
 def discover_volume(ng_state: dict) -> VolumeInfo:
     """Extract volume metadata from an NG state dict.
 
@@ -174,14 +230,16 @@ def discover_volume(ng_state: dict) -> VolumeInfo:
         if isinstance(source, str) and "zarr" in source:
             extent = read_shape_from_source(source)
 
-        layers.append(LayerInfo(
+        layer_info = LayerInfo(
             name=layer.get("name", "unknown"),
             type=layer.get("type", "image"),
             source=source,
             extent=extent,
             visible=visible,
             shader_range=shader_range,
-        ))
+        )
+        layer_info.role = _infer_layer_role(layer_info)
+        layers.append(layer_info)
 
     # ── Compute bounding box (union of all layers with known extent) ──
     layers_with_extent = [l for l in layers if l.extent]
@@ -356,4 +414,76 @@ def format_fov_feedback(
         f"{names[ax1]}=[{window[ax1][0]:.0f}..{window[ax1][1]:.0f}], "
         f"{names[ax2]}=[{window[ax2][0]:.0f}..{window[ax2][1]:.0f}] "
         f"({fov[ax1]:.0f}\u00d7{fov[ax2]:.0f} voxels)]"
+    )
+
+
+# ── Pixel ↔ Physical Coordinate Translation ──────────────────────────────
+
+def pixel_to_physical(
+    pixel_x: float,
+    pixel_y: float,
+    view_center: tuple[float, float, float],
+    scale: float,
+    layout: str,
+) -> tuple[float, float, float]:
+    """Convert canvas pixel coordinates to physical \u00b5m coordinates.
+
+    Parameters
+    ----------
+    pixel_x, pixel_y : float
+        Position on the 1024\u00d71024 canvas (origin top-left).
+    view_center : tuple
+        (cx, cy, cz) center of the current view in \u00b5m.
+    scale : float
+        crossSectionScale (\u00b5m per pixel).
+    layout : str
+        Panel layout: "xy", "xz", or "yz".
+
+    Returns
+    -------
+    (phys_x, phys_y, phys_z) in \u00b5m.
+    """
+    half = VIEWPORT_SIZE / 2  # 512
+    dx = (pixel_x - half) * scale
+    dy = (pixel_y - half) * scale
+    cx, cy, cz = view_center
+
+    if layout == "xz":
+        return (cx + dx, cy, cz + dy)
+    elif layout == "yz":
+        return (cx, cy + dx, cz + dy)
+    else:  # "xy", "4panel", default
+        return (cx + dx, cy + dy, cz)
+
+
+def summarize_spatial_distribution(
+    phys_points: list[tuple[float, float, float]],
+    volume_info: VolumeInfo,
+) -> str:
+    """Summarize where count detections cluster in physical space.
+
+    Parameters
+    ----------
+    phys_points : list of (x, y, z) tuples in \u00b5m.
+    volume_info : VolumeInfo for volume extent context.
+
+    Returns
+    -------
+    Text summary of spatial extent and centroid of detections.
+    """
+    if not phys_points:
+        return "No detections to summarize."
+
+    xs = [p[0] for p in phys_points]
+    ys = [p[1] for p in phys_points]
+    zs = [p[2] for p in phys_points]
+    s = volume_info.shape
+
+    return (
+        f"Spatial distribution of {len(phys_points)} detections:\n"
+        f"  x=[{min(xs):.0f}..{max(xs):.0f}] of [0..{s[0]:.0f}]\n"
+        f"  y=[{min(ys):.0f}..{max(ys):.0f}] of [0..{s[1]:.0f}]\n"
+        f"  z=[{min(zs):.0f}..{max(zs):.0f}] of [0..{s[2]:.0f}]\n"
+        f"  Centroid: ({sum(xs)/len(xs):.0f}, {sum(ys)/len(ys):.0f}, "
+        f"{sum(zs)/len(zs):.0f})"
     )
