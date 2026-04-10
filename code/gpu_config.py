@@ -9,14 +9,15 @@ asymmetric (CPU-parking) at the cost of ~30s extra per Molmo load.
 """
 
 import gc
+import os
 import time
 
 import torch
 
 # ── Checkpoints ──────────────────────────────────────────────────────────────
 
-MOLMO_CHECKPOINT = "/data/molmo-glancer-v4-models/checkpoints/Molmo2-O-7B"
-OLMO_CHECKPOINT = "/data/molmo-glancer-v4-models/checkpoints/Olmo-3.1-32B-Think"
+MOLMO_CHECKPOINT = "/data/molmo-glancer-v4-models/Molmo2-O-7B"
+OLMO_CHECKPOINT = "/data/molmo-glancer-v4-models/Olmo-3.1-32B-Think"
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -147,6 +148,12 @@ class ModelManager:
         t0 = time.time()
         print(f"\n[ModelManager] swap_to_molmo ...")
 
+        if not os.path.isdir(MOLMO_CHECKPOINT):
+            raise RuntimeError(
+                f"Molmo checkpoint not found at {MOLMO_CHECKPOINT}\n"
+                f"  Contents of /data/: {os.listdir('/data/') if os.path.isdir('/data/') else 'NOT FOUND'}"
+            )
+
         self._unload_all()
 
         self.molmo_processor = AutoProcessor.from_pretrained(
@@ -177,6 +184,12 @@ class ModelManager:
 
         t0 = time.time()
         print(f"\n[ModelManager] swap_to_olmo ...")
+
+        if not os.path.isdir(OLMO_CHECKPOINT):
+            raise RuntimeError(
+                f"OLMo checkpoint not found at {OLMO_CHECKPOINT}\n"
+                f"  Contents of /data/: {os.listdir('/data/') if os.path.isdir('/data/') else 'NOT FOUND'}"
+            )
 
         self._unload_all()
 
