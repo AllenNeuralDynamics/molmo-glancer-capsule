@@ -2,3 +2,8 @@
 # postInstall — runs after Docker image build.
 # Runtime dependencies are installed via _dev_startup.sh at capsule start.
 set -e
+
+pip3 install --no-cache-dir torchvision --upgrade --extra-index-url https://download.pytorch.org/whl/cu124
+
+# Install Chromium for Playwright (system deps already in apt-get)
+playwright install chromium

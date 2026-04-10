@@ -15,12 +15,60 @@
 					"version": "4:11.2.0-1ubuntu1"
 				},
 				{
+					"name": "libasound2"
+				},
+				{
+					"name": "libatk-bridge2.0-0"
+				},
+				{
+					"name": "libatk1.0-0"
+				},
+				{
+					"name": "libatspi2.0-0"
+				},
+				{
+					"name": "libcairo2"
+				},
+				{
+					"name": "libcups2"
+				},
+				{
+					"name": "libdrm2"
+				},
+				{
+					"name": "libgbm1"
+				},
+				{
 					"name": "libgl1-mesa-glx",
 					"version": "23.0.4-0ubuntu1~22.04.1"
 				},
 				{
 					"name": "libglib2.0-0",
 					"version": "2.72.4-0ubuntu2.9"
+				},
+				{
+					"name": "libnspr4"
+				},
+				{
+					"name": "libnss3"
+				},
+				{
+					"name": "libpango-1.0-0"
+				},
+				{
+					"name": "libxcomposite1"
+				},
+				{
+					"name": "libxdamage1"
+				},
+				{
+					"name": "libxfixes3"
+				},
+				{
+					"name": "libxkbcommon0"
+				},
+				{
+					"name": "libxrandr2"
 				}
 			],
 			"install_software_properties_common": true
@@ -28,19 +76,54 @@
 		"pip3": {
 			"packages": [
 				{
+					"name": "accelerate"
+				},
+				{
 					"name": "ai2-olmo-core",
 					"version": "2.4.0"
+				},
+				{
+					"name": "bitsandbytes"
+				},
+				{
+					"name": "decord2"
+				},
+				{
+					"name": "einops"
+				},
+				{
+					"name": "httpx"
+				},
+				{
+					"name": "imageio[ffmpeg]"
+				},
+				{
+					"name": "molmo-utils"
+				},
+				{
+					"name": "pillow"
+				},
+				{
+					"name": "playwright",
+					"version": "1.44"
+				},
+				{
+					"name": "s3fs"
+				},
+				{
+					"name": "scikit-image"
+				},
+				{
+					"name": "transformers"
+				},
+				{
+					"name": "zarr"
 				}
 			],
 			"options": {},
 			"pre_install_options": {}
 		},
 		"vscode": {
-			"packages": [
-				{
-					"name": "anthropic.claude-code"
-				}
-			],
 			"version": "4.100.3"
 		}
 	}
