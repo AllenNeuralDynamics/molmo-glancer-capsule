@@ -5,11 +5,11 @@
 #   bash run.sh --preset neurons        # single preset
 #   bash run.sh --preset all            # all presets with stashing
 #
+# Always runs dev startup first.
 # When --preset all:
-#   1. Runs dev startup
-#   2. Runs each preset, stashing results after each
-#   3. Unstashes all into /results/<preset_name>/
-#   4. Prints summary table
+#   1. Runs each preset, stashing results after each
+#   2. Unstashes all into /results/<preset_name>/
+#   3. Prints summary table
 
 set -euo pipefail
 
@@ -25,6 +25,9 @@ echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || 
 echo "  VRAM: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
 echo "  Start: $(date -Iseconds)"
 echo ""
+
+# ── Dev startup (always) ──────────────────────────────────────────────────
+bash /code/_dev_startup.sh
 
 # ── Check if --preset all ────────────────────────────────────────────────
 PRESET_ARG=""
@@ -49,14 +52,9 @@ if [[ "$PRESET_ARG" == "all" ]]; then
     echo "  All-Presets Run: ${PRESETS[*]}"
     echo "========================================================"
 
-    # Phase 1: Dev startup
+    # Phase 1: Run each preset → stash
     echo ""
-    echo "  Phase 1/3: Dev startup"
-    bash /code/_dev_startup.sh
-
-    # Phase 2: Run each preset → stash
-    echo ""
-    echo "  Phase 2/3: Running ${#PRESETS[@]} presets"
+    echo "  Phase 1/2: Running ${#PRESETS[@]} presets"
 
     for i in "${!PRESETS[@]}"; do
         preset="${PRESETS[$i]}"
@@ -85,9 +83,9 @@ if [[ "$PRESET_ARG" == "all" ]]; then
         echo "  Preset ${preset}: ${STATUSES[$i]} (${DURATIONS[$i]}s)"
     done
 
-    # Phase 3: Unstash all
+    # Phase 2: Unstash all
     echo ""
-    echo "  Phase 3/3: Unstash all results"
+    echo "  Phase 2/2: Unstash all results"
     bash /code/cleanup.sh
     bash /code/unstash_results.sh
 
