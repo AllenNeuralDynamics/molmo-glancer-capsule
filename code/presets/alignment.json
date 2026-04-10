@@ -1,0 +1,4 @@
+{
+  "ng_link": "/root/capsule/code/ng_links/example_r2r_ng_link.txt",
+  "question": "How well are the neurons aligned between the fixed (green) and moving (magenta) volumes? Use layerVisibility to compare: show each layer alone, then overlay both. Look for overlap, shifts, and misregistration between the two."
+}

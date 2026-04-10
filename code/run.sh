@@ -43,7 +43,18 @@ done
 
 if [[ "$PRESET_ARG" == "all" ]]; then
     # ── All-presets mode ─────────────────────────────────────────────────
-    PRESETS=(neurons alignment neurons_large alignment_loop segmentation)
+    # Discover presets from JSON files in /code/presets/
+    PRESETS_DIR="/root/capsule/code/presets"
+    PRESETS=()
+    for f in "$PRESETS_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        name="$(basename "$f" .json)"
+        PRESETS+=("$name")
+    done
+    if [[ ${#PRESETS[@]} -eq 0 ]]; then
+        echo "ERROR: No preset JSON files found in $PRESETS_DIR"
+        exit 1
+    fi
     TOTAL_START=$(date +%s)
     declare -a DURATIONS
     declare -a STATUSES

@@ -1,0 +1,4 @@
+{
+  "ng_link": "/root/capsule/code/ng_links/alignment_loop.txt",
+  "question": "How does neuron alignment change across the iterative alignment loops? The fixed volume is green, the moving volume is magenta, and the moving segmentation layers are white/black. Some layers are initially disabled \u2014 the initial view shows the fixed reference and the final aligned moving volume. Use layerVisibility to enable other loop layers and compare alignment quality across iterations, including the Raw (unwarped) moving round."
+}

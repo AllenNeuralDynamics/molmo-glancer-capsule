@@ -1,0 +1,4 @@
+{
+  "ng_link": "/root/capsule/code/ng_links/segmentation.txt",
+  "question": "Evaluate the quality of the GFP segmentation overlay. Compare the segmentation layer against the raw image channel \u2014 do the segmented regions accurately capture the fluorescent structures? Look for over-segmentation, under-segmentation, and boundary accuracy."
+}
