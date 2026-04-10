@@ -15,28 +15,36 @@
 					"version": "4:11.2.0-1ubuntu1"
 				},
 				{
-					"name": "libasound2"
+					"name": "libasound2",
+					"version": "1.2.6.1-1ubuntu1.1"
 				},
 				{
-					"name": "libatk-bridge2.0-0"
+					"name": "libatk-bridge2.0-0",
+					"version": "2.38.0-3"
 				},
 				{
-					"name": "libatk1.0-0"
+					"name": "libatk1.0-0",
+					"version": "2.36.0-3build1"
 				},
 				{
-					"name": "libatspi2.0-0"
+					"name": "libatspi2.0-0",
+					"version": "2.44.0-3"
 				},
 				{
-					"name": "libcairo2"
+					"name": "libcairo2",
+					"version": "1.16.0-5ubuntu2.1"
 				},
 				{
-					"name": "libcups2"
+					"name": "libcups2",
+					"version": "2.4.1op1-1ubuntu4.16"
 				},
 				{
-					"name": "libdrm2"
+					"name": "libdrm2",
+					"version": "2.4.113-2~ubuntu0.22.04.1"
 				},
 				{
-					"name": "libgbm1"
+					"name": "libgbm1",
+					"version": "23.2.1-1ubuntu3.1~22.04.3"
 				},
 				{
 					"name": "libgl1-mesa-glx",
@@ -47,28 +55,36 @@
 					"version": "2.72.4-0ubuntu2.9"
 				},
 				{
-					"name": "libnspr4"
+					"name": "libnspr4",
+					"version": "2:4.35-0ubuntu0.22.04.1"
 				},
 				{
-					"name": "libnss3"
+					"name": "libnss3",
+					"version": "2:3.98-0ubuntu0.22.04.3"
 				},
 				{
-					"name": "libpango-1.0-0"
+					"name": "libpango-1.0-0",
+					"version": "1.50.6+ds-2ubuntu1"
 				},
 				{
-					"name": "libxcomposite1"
+					"name": "libxcomposite1",
+					"version": "1:0.4.5-1build2"
 				},
 				{
-					"name": "libxdamage1"
+					"name": "libxdamage1",
+					"version": "1:1.1.5-2build2"
 				},
 				{
-					"name": "libxfixes3"
+					"name": "libxfixes3",
+					"version": "1:6.0.0-1"
 				},
 				{
-					"name": "libxkbcommon0"
+					"name": "libxkbcommon0",
+					"version": "1.4.0-1"
 				},
 				{
-					"name": "libxrandr2"
+					"name": "libxrandr2",
+					"version": "2:1.5.2-1build1"
 				}
 			],
 			"install_software_properties_common": true
@@ -76,48 +92,60 @@
 		"pip3": {
 			"packages": [
 				{
-					"name": "accelerate"
+					"name": "accelerate",
+					"version": "1.13.0"
 				},
 				{
 					"name": "ai2-olmo-core",
 					"version": "2.4.0"
 				},
 				{
-					"name": "bitsandbytes"
+					"name": "bitsandbytes",
+					"version": "0.49.2"
 				},
 				{
-					"name": "decord2"
+					"name": "decord2",
+					"version": "3.3.0"
 				},
 				{
-					"name": "einops"
+					"name": "einops",
+					"version": "0.8.2"
 				},
 				{
-					"name": "httpx"
+					"name": "httpx",
+					"version": "0.28.1"
 				},
 				{
-					"name": "imageio[ffmpeg]"
+					"name": "imageio[ffmpeg]",
+					"version": "2.37.3"
 				},
 				{
-					"name": "molmo-utils"
+					"name": "molmo-utils",
+					"version": "0.0.1"
 				},
 				{
-					"name": "pillow"
+					"name": "pillow",
+					"version": "12.2.0"
 				},
 				{
 					"name": "playwright",
-					"version": "1.44"
+					"version": "1.44.0"
 				},
 				{
-					"name": "s3fs"
+					"name": "s3fs",
+					"version": "2026.3.0"
 				},
 				{
-					"name": "scikit-image"
+					"name": "scikit-image",
+					"version": "0.26.0"
 				},
 				{
-					"name": "transformers"
+					"name": "transformers",
+					"version": "5.5.3"
 				},
 				{
-					"name": "zarr"
+					"name": "zarr",
+					"version": "3.1.6"
 				}
 			],
 			"options": {},
