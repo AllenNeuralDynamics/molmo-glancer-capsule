@@ -161,7 +161,8 @@ def strip_think_tokens(text: str) -> tuple[str, str, bool]:
 
 
 def ask_text_olmo(manager, system_prompt: str, user_prompt: str,
-                  max_new_tokens: int = 4096, sampling: dict | None = None):
+                  max_new_tokens: int = 4096, sampling: dict | None = None,
+                  think: bool = True):
     """OLMo text generation via ChatML system+user roles.
 
     Handles think token stripping and truncation detection.
@@ -180,6 +181,9 @@ def ask_text_olmo(manager, system_prompt: str, user_prompt: str,
     sampling : dict or None
         Sampling parameters (temperature, top_p, etc.). If None, uses
         CONFIG["olmo_sampling_structured"].
+    think : bool
+        If False, append </think> to input so model skips thinking and
+        responds directly. Saves tokens and time for structured outputs.
     """
     model = manager.olmo_model
     tokenizer = manager.olmo_tokenizer
@@ -191,6 +195,13 @@ def ask_text_olmo(manager, system_prompt: str, user_prompt: str,
     input_ids = tokenizer.apply_chat_template(
         messages, return_tensors="pt", add_generation_prompt=True,
     ).to(model.device)
+
+    # Disable thinking by closing the <think> block immediately
+    if not think:
+        close_ids = tokenizer.encode("</think>\n", add_special_tokens=False)
+        close_tensor = torch.tensor([close_ids], device=input_ids.device)
+        input_ids = torch.cat([input_ids, close_tensor], dim=1)
+
     input_len = input_ids.shape[1]
 
     gen_kwargs = dict(sampling or CONFIG["olmo_sampling_structured"])
@@ -1025,6 +1036,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 manager, OLMO_SYSTEM_PROMPT, action_prompt,
                 max_new_tokens=config["olmo_max_new_tokens_decision"],
                 sampling=config["olmo_sampling_structured"],
+                think=False,
             )
             elapsed = time.time() - t0
             track(iteration, "action", tokens, "olmo", elapsed)
@@ -1047,6 +1059,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                     manager, OLMO_SYSTEM_PROMPT, retry_prompt,
                     max_new_tokens=config["olmo_max_new_tokens_retry"],
                     sampling=config["olmo_sampling_retry"],
+                    think=False,
                 )
                 elapsed = time.time() - t0
                 track(iteration, "action_retry", tokens, "olmo", elapsed)
@@ -1168,6 +1181,7 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
                 manager, OLMO_SYSTEM_PROMPT, instr_prompt,
                 max_new_tokens=config["olmo_max_new_tokens_vision_instr"],
                 sampling=config["olmo_sampling_structured"],
+                think=False,
             )
             elapsed = time.time() - t0
             track(iteration, "vision_instructions", tokens, "olmo", elapsed)
