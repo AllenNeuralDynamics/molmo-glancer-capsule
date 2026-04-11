@@ -50,7 +50,11 @@ You must respond with exactly one JSON object. Available actions:
     "frames": {max_scan_frames}, "layout": "xy", "zoom": "full",
     "target": "neurons", "keyframe_interval": 5}}
    The system automatically detects and marks each instance in sampled keyframes —
-   you get back exact per-frame counts. Use count when you need quantitative results.
+   you get back exact per-frame counts.
+   Use count ONLY when the question asks "how many?" or you need an actual inventory.
+   Count answers quantity — it does NOT assess quality, accuracy, or correctness
+   of what it detects. Do not use count as a proxy for evaluating whether something
+   is good or bad — use screenshot or scan for visual comparison instead.
    A scan first can help you decide what to count, where, and at what zoom.
    keyframe_interval: spacing between sampled frames (2-3 for small/dense, 5-10 for large/sparse).
    "target" should be a short noun describing what to count.
@@ -154,8 +158,20 @@ def build_plan_prompt(question, volume_info, first_look_finding, findings_text,
         f"{finding_block}"
         f"INVESTIGATION SO FAR:\n\n{findings_text}\n\n"
         f"Analyze the latest finding in context, then decide what to investigate next.\n\n"
-        f"If you have enough evidence to answer the question confidently, respond with:\n"
-        f'{{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}'
+        f"EVIDENCE CHECK — before concluding, ask yourself:\n"
+        f"- Does my evidence DIRECTLY address the question, or is it only indirect/proxy?\n"
+        f"  Counts and distributions describe what is present — they do NOT assess quality,\n"
+        f"  accuracy, alignment, or correctness. Those require visual comparison.\n"
+        f"- Could the pattern I see have a simpler explanation?\n"
+        f"  Variation in measurements across spatial positions usually reflects natural\n"
+        f"  biological variation (e.g. cell density differs by depth), not errors.\n"
+        f"  Do not interpret measurement variation as evidence of a problem without\n"
+        f"  visual confirmation at the specific locations in question.\n"
+        f"- Am I answering based on what I SAW, or on assumptions about what numbers MEAN?\n\n"
+        f"If you have gathered enough DIRECT visual evidence to answer confidently:\n"
+        f'  {{\"action\": \"answer\", \"answer\": \"your specific answer here\"}}\n'
+        f"Otherwise, describe your next investigation step IN PROSE (not JSON).\n"
+        f"Explain what to look at, where, and why."
     )
 
 
@@ -165,12 +181,13 @@ def build_action_prompt(plan_text, volume_info, config):
     return (
         f"YOUR INVESTIGATION PLAN:\n{plan_text}\n\n"
         f"{schema}\n\n"
-        f"Output ONLY the JSON action object.\n"
+        f"Translate the investigation plan above into exactly one JSON action object.\n"
+        f"Your action MUST match the intent of the plan — do not substitute a different\n"
+        f"action type than what the plan describes.\n\n"
         f"Include \"purpose\" and \"prompt\" for visual actions,\n"
         f"and \"target_refinement\" for count actions.\n\n"
         f"Your \"prompt\" will be sent directly to the vision model along with the\n"
-        f"captured image or video. Write it to elicit the observation you need.\n\n"
-        f"If you already have enough evidence, use the answer action instead."
+        f"captured image or video. Write it to elicit the observation you need."
     )
 
 

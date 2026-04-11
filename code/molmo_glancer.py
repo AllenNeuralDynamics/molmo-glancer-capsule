@@ -687,7 +687,13 @@ def run_agent(manager, config: dict, ng_link: str, question: str):
             f"QUESTION: \"{question}\"\n\n"
             f"INVESTIGATION COMPLETE \u2014 ALL FINDINGS:\n{findings_text}\n\n"
             f"Synthesize ALL findings into a comprehensive answer.\n"
-            f"Be specific and cite evidence from your observations."
+            f"Be specific and cite evidence from your observations.\n\n"
+            f"Weighting: Direct visual observations (what was seen in screenshots and scans)\n"
+            f"are primary evidence. Quantitative metrics (counts, distributions) are supporting\n"
+            f"context only \u2014 they describe what is present but do not by themselves indicate\n"
+            f"whether something is correct or incorrect. If counts vary across the volume,\n"
+            f"consider whether this reflects natural biological variation before attributing\n"
+            f"it to errors."
         )
         t0 = time.time()
         answer_text, tokens, _ = ask_text_olmo(
@@ -765,7 +771,20 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
         'LATEST FINDING (iteration N-1):\n{last_finding}\n\n'
         'INVESTIGATION SO FAR:\n{findings_text}\n\n'
         'Analyze the latest finding in context, then decide what to investigate next.\n\n'
-        'If enough evidence: {"action": "answer", "answer": "..."}'
+        'EVIDENCE CHECK — before concluding, ask yourself:\n'
+        '- Does my evidence DIRECTLY address the question, or is it only indirect/proxy?\n'
+        '  Counts and distributions describe what is present — they do NOT assess quality,\n'
+        '  accuracy, alignment, or correctness. Those require visual comparison.\n'
+        '- Could the pattern I see have a simpler explanation?\n'
+        '  Variation in measurements across spatial positions usually reflects natural\n'
+        '  biological variation (e.g. cell density differs by depth), not errors.\n'
+        '  Do not interpret measurement variation as evidence of a problem without\n'
+        '  visual confirmation at the specific locations in question.\n'
+        '- Am I answering based on what I SAW, or on assumptions about what numbers MEAN?\n\n'
+        'If you have gathered enough DIRECT visual evidence to answer confidently:\n'
+        '  {"action": "answer", "answer": "your specific answer here"}\n'
+        'Otherwise, describe your next investigation step IN PROSE (not JSON).\n'
+        'Explain what to look at, where, and why.'
     )
     md.append("```\n")
 
@@ -779,12 +798,13 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
     md.append(
         'YOUR INVESTIGATION PLAN:\n{plan_text}\n\n'
         '{action_schema}\n\n'
-        'Output ONLY the JSON action object.\n'
+        'Translate the investigation plan above into exactly one JSON action object.\n'
+        'Your action MUST match the intent of the plan — do not substitute a different\n'
+        'action type than what the plan describes.\n\n'
         'Include "purpose" and "prompt" for visual actions,\n'
         'and "target_refinement" for count actions.\n\n'
         'Your "prompt" will be sent directly to the vision model along with the\n'
-        'captured image or video. Write it to elicit the observation you need.\n\n'
-        'If you already have enough evidence, use the answer action instead.'
+        'captured image or video. Write it to elicit the observation you need.'
     )
     md.append("```\n")
 
@@ -826,7 +846,13 @@ def save_prompt_templates(volume_info: VolumeInfo, config: dict, question: str):
         f'QUESTION: "{question}"\n\n'
         'INVESTIGATION COMPLETE \u2014 ALL FINDINGS:\n{findings_text}\n\n'
         'Synthesize ALL findings into a comprehensive answer.\n'
-        'Be specific and cite evidence from your observations.'
+        'Be specific and cite evidence from your observations.\n\n'
+        'Weighting: Direct visual observations (what was seen in screenshots and scans)\n'
+        'are primary evidence. Quantitative metrics (counts, distributions) are supporting\n'
+        'context only — they describe what is present but do not by themselves indicate\n'
+        'whether something is correct or incorrect. If counts vary across the volume,\n'
+        'consider whether this reflects natural biological variation before attributing\n'
+        'it to errors.'
     )
     md.append("```\n")
 
