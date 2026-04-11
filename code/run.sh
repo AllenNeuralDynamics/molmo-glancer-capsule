@@ -24,6 +24,9 @@ echo "  VRAM: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev
 echo "  Start: $(date -Iseconds)"
 echo ""
 
+echo "Running with args:"
+echo "$@"
+
 # ── Check if --preset all ────────────────────────────────────────────────
 PRESET_ARG=""
 for arg in "$@"; do
