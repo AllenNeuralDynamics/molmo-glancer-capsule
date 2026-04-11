@@ -1,4 +1,4 @@
 {
   "ng_link": "/root/capsule/code/ng_links/large_ng_link.txt",
-  "question": "How many neurons can you count in this volume?"
+  "question": "How many neurons can you count in this volume? the soma of neurons are visible as roughly 30um in diameter spheres. You can use the ng_link to help you count the neurons. Please provide a number and a brief explanation of how you arrived at that number."
 }
