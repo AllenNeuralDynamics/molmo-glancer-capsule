@@ -33,6 +33,9 @@ for arg in "$@"; do
     fi
     if [[ "$arg" == "--preset" ]]; then
         PRESET_ARG="pending"
+    elif [[ "$arg" == --preset=* ]]; then
+        PRESET_ARG="${arg#--preset=}"
+        break
     fi
 done
 
